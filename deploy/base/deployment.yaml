@@ -23,7 +23,7 @@ spec:
       serviceAccountName: kube-autopsy
       containers:
         - name: controller
-          image: kube-autopsy:latest
+          image: ghcr.io/stone/kube-autopsy:latest
           args: ["controller", "--leader-elect=true"]
           ports:
             - name: metrics
