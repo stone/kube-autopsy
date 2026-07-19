@@ -86,11 +86,12 @@ jobs:
 
       - name: Build Kubernetes Manifest
         run: |
+          VERSION="${{ github.ref_name }}"
           cat <<EOF >> deploy/base/kustomization.yaml
           images:
             - name: ghcr.io/stone/kube-autopsy
               newName: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-              newTag: ${{ github.ref_name }}
+              newTag: ${VERSION#v}
           EOF
           kubectl kustomize deploy/base > install.yaml
 
