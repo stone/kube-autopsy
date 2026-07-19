@@ -176,15 +176,15 @@ phase_deploy() {
     kubectl apply -f "${PROJECT_ROOT}/deploy/base/clusterrolebinding.yaml"
     ok "RBAC applied"
 
-    # Patch manifests to use the e2e image (instead of kube-autopsy:latest)
+    # Patch manifests to use the e2e image (instead of ghcr.io/stone/kube-autopsy:latest)
     log "Deploying controller..."
-    sed "s|kube-autopsy:latest|${IMAGE_NAME}|g" "${PROJECT_ROOT}/deploy/base/deployment.yaml" \
+    sed -E "s|ghcr.io/stone/kube-autopsy:latest|${IMAGE_NAME}|g; s|kube-autopsy:latest|${IMAGE_NAME}|g" "${PROJECT_ROOT}/deploy/base/deployment.yaml" \
         | sed 's/--leader-elect=true/--leader-elect=false/' \
         | kubectl apply -f -
     ok "Controller deployed"
 
     log "Deploying DaemonSet agent..."
-    sed "s|kube-autopsy:latest|${IMAGE_NAME}|g" "${PROJECT_ROOT}/deploy/base/daemonset.yaml" \
+    sed -E "s|ghcr.io/stone/kube-autopsy:latest|${IMAGE_NAME}|g; s|kube-autopsy:latest|${IMAGE_NAME}|g" "${PROJECT_ROOT}/deploy/base/daemonset.yaml" \
         | kubectl apply -f -
     ok "DaemonSet applied"
 
