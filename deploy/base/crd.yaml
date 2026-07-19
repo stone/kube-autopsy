@@ -4,9 +4,9 @@ kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.21.0
-  name: podcrashreports.autopsy.io
+  name: podcrashreports.autopsy.tty.se
 spec:
-  group: autopsy.io
+  group: autopsy.tty.se
   names:
     kind: PodCrashReport
     listKind: PodCrashReportList

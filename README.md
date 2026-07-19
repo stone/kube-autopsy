@@ -106,7 +106,7 @@ kubectl get pcr oom-victim-hogger-20260718-132428 -o yaml
 
 **Example Output:**
 ```yaml
-apiVersion: autopsy.io/v1alpha1
+apiVersion: autopsy.tty.se/v1alpha1
 kind: PodCrashReport
 metadata:
   name: oom-victim-hogger-20260718-132428

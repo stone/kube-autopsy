@@ -1,6 +1,6 @@
-// Package v1alpha1 contains API Schema definitions for the autopsy.io v1alpha1 API group.
+// Package v1alpha1 contains API Schema definitions for the autopsy.tty.se v1alpha1 API group.
 // +kubebuilder:object:generate=true
-// +groupName=autopsy.io
+// +groupName=autopsy.tty.se
 package v1alpha1
 
 import (
