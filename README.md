@@ -66,10 +66,11 @@ and Kubernetes semantics.
 * The cluster must allow `privileged: true` DaemonSets.
 
 ### Deploying to your cluster
-To install the CRDs, Agent, and Controller, clone this repository and apply the base manifests via `kustomize`:
+
+You can easily install the latest release directly using the pre-compiled manifest:
 
 ```bash
-kubectl apply -k deploy/base/
+kubectl apply -f https://github.com/stone/kube-autopsy/releases/latest/download/install.yaml
 ```
 
 Verify that the components are running:

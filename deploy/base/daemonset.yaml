@@ -23,7 +23,7 @@ spec:
       hostPID: true
       containers:
         - name: agent
-          image: kube-autopsy:latest
+          image: ghcr.io/stone/kube-autopsy:latest
           args: ["agent"]
           env:
             - name: NODE_NAME
