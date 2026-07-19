@@ -155,34 +155,34 @@ automatically.
 Because `kube-autopsy` populates the `spec` and `status` with rich metadata, you can use `kubectl`'s native JSONPath to filter reports for specific workloads.
 
 **Find all crash reports for a specific pod (e.g., `oom-victim`):**
-\`\`\`bash
+```bash
 kubectl get pcr -o jsonpath='{.items[?(@.spec.podName=="oom-victim")].metadata.name}'
-\`\`\`
+```
 
 **Find all OOM reports triggered by a specific process (e.g., `java`):**
-\`\`\`bash
+```bash
 kubectl get pcr -o jsonpath='{range .items[?(@.status.diagnostics.triggerComm=="java")]}{.metadata.name}{"\n"}{end}'
-\`\`\`
+```
 
 **Show the Peak Memory (in MB) for all crashes in the cluster:**
-\`\`\`bash
+```bash
 kubectl get pcr -o custom-columns=NAME:.metadata.name,POD:.spec.podName,PEAK_MEM_MB:.status.diagnostics.peakMemoryBytes \
   | awk 'NR>1 {$3=int($3/1024/1024)" MB"; print} NR==1 {print}'
-\`\`\`
+```
 
 **Extract the byte-precise memory footprint (RSS Dissection) of a specific crash:**
-\`\`\`bash
+```bash
 kubectl get pcr oom-victim-hogger-20260718 -o jsonpath='{.status.diagnostics.rssDissection}'
 # Output: {"anonRssBytes":62812160,"fileRssBytes":1019904,"pageTablesBytes":176128}
-\`\`\`
+```
 
 ### K9s Integration
 If you use [k9s](https://k9scli.io/), you can supercharge your debugging experience using our official plugin! 
 
-Simply copy the provided configuration file into your local k9s configuration directory (usually `~/.config/k9s/plugins.yml`):
-\`\`\`bash
-cat integrations/k9s/plugins.yml >> ~/.config/k9s/plugins.yml
-\`\`\`
+Simply copy the provided configuration file into your local k9s plusin configuration directory (usually `~/.config/k9s/plugins/`):
+```bash
+curl https://raw.githubusercontent.com/stone/kube-autopsy/refs/heads/main/integrations/k9s/plugins.yml -O ~/.config/k9s/plugins/kube-autopsy.yml
+```
 
 Once installed, you'll gain the following shortcuts in the `k9s` UI:
 - `Shift-C` (While selecting a **Pod**): Instantly queries the cluster and opens the associated `PodCrashReport` if the pod crashed.
