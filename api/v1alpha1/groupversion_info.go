@@ -7,7 +7,7 @@ import (
 
 var (
 	// GroupVersion is the API group and version for this package.
-	GroupVersion = schema.GroupVersion{Group: "autopsy.io", Version: "v1alpha1"}
+	GroupVersion = schema.GroupVersion{Group: "autopsy.tty.se", Version: "v1alpha1"}
 
 	// SchemeBuilder is used to add go types to the GroupVersionResource scheme.
 	SchemeBuilder = &scheme.Builder{GroupVersion: GroupVersion}

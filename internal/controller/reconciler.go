@@ -31,8 +31,8 @@ type PodCrashReportReconciler struct {
 // reports are transitioned to "Processed", a Kubernetes Event is recorded, and
 // an optional webhook notification is sent.
 //
-// +kubebuilder:rbac:groups=autopsy.io,resources=podcrashreports,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=autopsy.io,resources=podcrashreports/status,verbs=update;patch
+// +kubebuilder:rbac:groups=autopsy.tty.se,resources=podcrashreports,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=autopsy.tty.se,resources=podcrashreports/status,verbs=update;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 func (r *PodCrashReportReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
