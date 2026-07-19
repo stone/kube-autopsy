@@ -75,10 +75,11 @@ jobs:
         run: echo "${TAGS}" | xargs -I {} cosign sign --yes {}@${DIGEST}
 
       - name: Generate SBOM
-        uses: anchore/sbom-action@v0.24.0
+        uses: anchore/sbom-action@v0
         with:
           image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build-and-push.outputs.digest }}
-          artifact-name: sbom.spdx.json
+          format: spdx-json
+          output-file: sbom.spdx.json
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3.0.2
