@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kube-autopsy
+  labels:
+    app.kubernetes.io/name: kube-autopsy
+    app.kubernetes.io/part-of: kube-autopsy

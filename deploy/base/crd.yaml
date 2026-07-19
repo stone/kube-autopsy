@@ -1,0 +1,169 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.21.0
+  name: podcrashreports.autopsy.io
+spec:
+  group: autopsy.io
+  names:
+    kind: PodCrashReport
+    listKind: PodCrashReportList
+    plural: podcrashreports
+    shortNames:
+    - pcr
+    singular: podcrashreport
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.podName
+      name: Pod
+      type: string
+    - jsonPath: .spec.containerName
+      name: Container
+      type: string
+    - jsonPath: .spec.terminationReason
+      name: Reason
+      type: string
+    - jsonPath: .spec.exitCode
+      name: Exit
+      type: integer
+    - jsonPath: .spec.nodeName
+      name: Node
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: PodCrashReport is the Schema for the podcrashreports API.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: PodCrashReportSpec defines the desired state of PodCrashReport.
+            properties:
+              containerName:
+                description: ContainerName is the specific container that crashed.
+                type: string
+              exitCode:
+                description: ExitCode is the container's exit code.
+                format: int32
+                type: integer
+              namespace:
+                description: Namespace is the namespace of the crashed pod.
+                type: string
+              nodeName:
+                description: NodeName is the node where the pod was running.
+                type: string
+              podName:
+                description: PodName is the name of the crashed pod.
+                type: string
+              terminationReason:
+                description: Termination is the reason for termination (e.g., OOMKilled,
+                  Error).
+                type: string
+              timestamp:
+                description: Timestamp is the ISO 8601 time of the crash event.
+                type: string
+            required:
+            - containerName
+            - exitCode
+            - namespace
+            - nodeName
+            - podName
+            - terminationReason
+            - timestamp
+            type: object
+          status:
+            description: PodCrashReportStatus defines the observed state of PodCrashReport.
+            properties:
+              diagnostics:
+                description: Diagnostics contains the captured diagnostic data.
+                properties:
+                  lastLogLines:
+                    description: LastLogLines are the final log lines captured before
+                      container termination.
+                    items:
+                      type: string
+                    type: array
+                  oomContext:
+                    description: OOMContext categorizes if the OOM was ContainerLimit
+                      or NodeExhaustion.
+                    type: string
+                  oomScore:
+                    description: OOMScore is the kernel's calculated OOM score.
+                    format: int32
+                    type: integer
+                  oomScoreAdj:
+                    description: OOMScoreAdj is the adjustment score applied to the
+                      victim.
+                    format: int32
+                    type: integer
+                  oomVictimComm:
+                    description: OOMVictimComm is the process name of the OOM victim
+                      (e.g., "java", "node").
+                    type: string
+                  oomVictimPid:
+                    description: OOMVictimPID is the PID of the process killed by
+                      the OOM killer.
+                    format: int32
+                    type: integer
+                  peakMemoryBytes:
+                    description: PeakMemoryBytes is the peak memory usage from cgroup
+                      memory.peak.
+                    format: int64
+                    type: integer
+                  rssDissection:
+                    description: RSSDissection contains the memory breakdown at the
+                      time of OOM.
+                    properties:
+                      anonRssBytes:
+                        format: int64
+                        type: integer
+                      fileRssBytes:
+                        format: int64
+                        type: integer
+                      pageTablesBytes:
+                        format: int64
+                        type: integer
+                    type: object
+                  triggerComm:
+                    description: TriggerComm is the name of the process that triggered
+                      the OOM.
+                    type: string
+                  triggerPid:
+                    description: TriggerPID is the PID of the process that triggered
+                      the OOM.
+                    format: int32
+                    type: integer
+                type: object
+              phase:
+                description: 'Phase indicates the processing state: Pending or Processed.'
+                type: string
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

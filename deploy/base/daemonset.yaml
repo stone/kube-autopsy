@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-autopsy-agent
+  namespace: kube-autopsy
+  labels:
+    app.kubernetes.io/name: kube-autopsy
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: kube-autopsy
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kube-autopsy
+      app.kubernetes.io/component: agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kube-autopsy
+        app.kubernetes.io/component: agent
+        app.kubernetes.io/part-of: kube-autopsy
+    spec:
+      serviceAccountName: kube-autopsy
+      hostPID: true
+      containers:
+        - name: agent
+          image: kube-autopsy:latest
+          args: ["agent"]
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+            - name: pod-logs
+              mountPath: /var/log/pods
+              readOnly: true
+            - name: host-proc
+              mountPath: /host-proc
+              readOnly: true
+            - name: debugfs
+              mountPath: /sys/kernel/debug
+      volumes:
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: pod-logs
+          hostPath:
+            path: /var/log/pods
+            type: Directory
+        - name: host-proc
+          hostPath:
+            path: /proc
+            type: Directory
+        - name: debugfs
+          hostPath:
+            path: /sys/kernel/debug
+            type: Directory
+      terminationGracePeriodSeconds: 30

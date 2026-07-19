@@ -1,0 +1,55 @@
+plugins:
+  # Plugin 1: Extract and format logs directly from a PodCrashReport
+  pcr-logs:
+    shortCut: l
+    confirm: false
+    description: "Autopsy Logs"
+    scopes:
+      - podcrashreports
+    command: bash
+    background: false
+    args:
+      - -c
+      - "kubectl get pcr $NAME -n $NAMESPACE -o jsonpath='{range .status.diagnostics.lastLogLines[*]}{@}{\"\\n\"}{end}' | less"
+
+  # Plugin 2: Extract memory context from a PodCrashReport
+  pcr-memory:
+    shortCut: m
+    confirm: false
+    description: "Autopsy Memory"
+    scopes:
+      - podcrashreports
+    command: bash
+    background: false
+    args:
+      - -c
+      - |
+        kubectl get pcr $NAME -n $NAMESPACE -o json | jq -r '
+        "OOM Context: \(.status.diagnostics.oomContext)",
+        "Trigger Process: \(.status.diagnostics.triggerComm) (PID: \(.status.diagnostics.triggerPid))",
+        "Victim Process: \(.status.diagnostics.oomVictimComm) (PID: \(.status.diagnostics.oomVictimPid))",
+        "Peak Memory (MB): \(.status.diagnostics.peakMemoryBytes / 1024 / 1024 | floor)",
+        "---",
+        "Anon RSS (Bytes): \(.status.diagnostics.rssDissection.anonRssBytes)",
+        "File RSS (Bytes): \(.status.diagnostics.rssDissection.fileRssBytes)",
+        "Page Tables (Bytes): \(.status.diagnostics.rssDissection.pageTablesBytes)"
+        ' | less
+
+  # Plugin 3: Jump from a standard Pod to its Crash Report
+  pod-autopsy:
+    shortCut: Shift-C
+    confirm: false
+    description: "Find Autopsy Report"
+    scopes:
+      - pods
+    command: bash
+    background: false
+    args:
+      - -c
+      - |
+        REPORT=$(kubectl get pcr -n $NAMESPACE -o json | jq -r ".items[] | select(.spec.podName==\"$NAME\") | .metadata.name" | head -n 1)
+        if [ -z "$REPORT" ]; then
+          echo "No PodCrashReport found for pod $NAME in namespace $NAMESPACE" | less
+        else
+          kubectl get pcr $REPORT -n $NAMESPACE -o yaml | less
+        fi

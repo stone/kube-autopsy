@@ -1,0 +1,12 @@
+apiVersion: kind.x-k8s.io/v1alpha4
+kind: Cluster
+nodes:
+  - role: control-plane
+    # Ensure cgroups v2 is available (kind nodes use cgroups v2 by default).
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            # Lower memory thresholds so OOM tests work in constrained environments.
+            eviction-hard: "memory.available<50Mi"

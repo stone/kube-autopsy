@@ -1,0 +1,112 @@
+# Test pod that deliberately triggers an OOM kill.
+# The pod has a 64Mi memory limit and tries to allocate 256Mi,
+# guaranteeing an OOM kill within seconds.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oom-victim
+  namespace: default
+  labels:
+    app: oom-victim
+    test: kube-autopsy-e2e
+spec:
+  restartPolicy: Never
+  containers:
+    - name: hogger
+      image: alpine:3.20
+      command:
+        - sh
+        - -c
+        - |
+          echo "=== kube-autopsy e2e test ==="
+          echo "Starting memory allocation..."
+          echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "Hostname: $(hostname)"
+          echo "PID: $$"
+          # Allocate memory until OOM killed.
+          # /dev/urandom writes to a variable, forcing real RSS allocation.
+          dd if=/dev/urandom bs=1M count=256 | cat > /dev/null &
+          # Alternative: use a simple loop to grow memory in a shell variable
+          i=0
+          while true; do
+            # Each iteration appends ~1MB to a variable
+            block=$(dd if=/dev/urandom bs=65536 count=16 2>/dev/null | base64)
+            eval "mem_$i=\$block"
+            i=$((i + 1))
+            echo "Allocated block $i (~1MB each)"
+          done
+      resources:
+        limits:
+          memory: "64Mi"
+        requests:
+          memory: "64Mi"
+---
+# Test pod that exits with a non-zero exit code (no OOM).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: exit-code-victim
+  namespace: default
+  labels:
+    app: exit-code-victim
+    test: kube-autopsy-e2e
+spec:
+  restartPolicy: Never
+  containers:
+    - name: failing-app
+      image: alpine:3.20
+      command:
+        - sh
+        - -c
+        - |
+          echo "=== kube-autopsy e2e exit-code test ==="
+          echo "This process will exit with code 1"
+          echo "Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          sleep 2
+          exit 1
+      resources:
+        limits:
+          memory: "32Mi"
+        requests:
+          memory: "32Mi"
+---
+# Test pod with multiple containers where one gets OOM killed.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: multi-container-victim
+  namespace: default
+  labels:
+    app: multi-container-victim
+    test: kube-autopsy-e2e
+spec:
+  restartPolicy: Never
+  containers:
+    - name: sidecar
+      image: alpine:3.20
+      command: ["sh", "-c", "echo 'sidecar running'; sleep 3600"]
+      resources:
+        limits:
+          memory: "32Mi"
+        requests:
+          memory: "32Mi"
+    - name: main-app
+      image: alpine:3.20
+      command:
+        - sh
+        - -c
+        - |
+          echo "=== multi-container OOM test ==="
+          echo "main-app will be OOM killed"
+          i=0
+          while true; do
+            block=$(dd if=/dev/urandom bs=65536 count=16 2>/dev/null | base64)
+            eval "mem_$i=\$block"
+            i=$((i + 1))
+            echo "Allocated block $i"
+          done
+      resources:
+        limits:
+          memory: "64Mi"
+        requests:
+          memory: "64Mi"
