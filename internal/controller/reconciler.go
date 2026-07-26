@@ -70,7 +70,7 @@ func (r *PodCrashReportReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	)
 
 	// Record a Kubernetes Event on the PodCrashReport resource.
-	r.Recorder.Eventf(&report, "Normal", "Processed",
+	r.Recorder.Eventf(&report, "Warning", "CrashDetected",
 		"Processed crash report for pod %s/%s (container: %s, reason: %s, exit code: %d)",
 		report.Spec.Namespace, report.Spec.PodName,
 		report.Spec.ContainerName, report.Spec.Termination, report.Spec.ExitCode,

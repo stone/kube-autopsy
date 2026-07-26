@@ -189,18 +189,46 @@ Once installed, you'll gain the following shortcuts in the `k9s` UI:
 - `l` (While selecting a **PodCrashReport**): Extracts and cleanly formats the final `lastLogLines` from the crash payload.
 - `m` (While selecting a **PodCrashReport**): Opens a parsed view of the exact eBPF memory footprint and OOM Context via `jq`.
 
-## Observability and Webhooks
+### Kubernetes Events
+When a pod crash is processed, the `kube-autopsy` controller emits a standard
+Kubernetes Event with the reason `CrashDetected` and type `Warning` on the
+`PodCrashReport` resource.
 
-`kube-autopsy` ships with enterprise-grade observability features:
+This allows for use of event-routing tools to send generic notifications to
+Slack, Discord, etc:
+
+- **[BotKube](https://botkube.io/):** Configure BotKube to monitor `PodCrashReport` events and forward them to your messaging platforms.
+- **[Robusta](https://robusta.dev/):** Build automated runbooks or alert routing based on `CrashDetected` events.
 
 ### Prometheus Metrics
-The Controller exposes a native `:8080/metrics` endpoint that exports rich contextual Prometheus metrics, allowing you to build detailed dashboards:
+The Controller exposes a native `:8080/metrics` endpoint that exports Prometheus metrics: 
+
 - `kube_autopsy_victim_anon_rss_bytes` (Histogram): Tracks the exact Anonymous RSS footprint of crashed containers.
 - `kube_autopsy_trigger_processes_total` (Counter): Tracks which specific applications (e.g. `java`, `node`) are triggering OOM events.
 - `kube_autopsy_reports_created_total` (Counter): Tracks overall crash volumes by namespace and node.
 
-### Slack Webhooks
-You can configure the controller to dispatch alerts to Slack by setting the `--webhook-url` flag. When a pod crashes, the controller immediately dispatches a rich payload directly to your channel:
+Example Alertmanager `PrometheusRule` to create generic alerts to Alertmanager whenever a crash occurs:
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kube-autopsy-alerts
+spec:
+  groups:
+  - name: kube-autopsy.rules
+    rules:
+    - alert: PodCrashDetected
+      expr: increase(kube_autopsy_reports_created_total[5m]) > 0
+      for: 0m
+      labels:
+        severity: warning
+      annotations:
+        summary: "Pod crash detected by kube-autopsy in namespace {{ $labels.namespace }}"
+        description: "A pod crash report was generated for reason {{ $labels.reason }} on node {{ $labels.node }}."
+```
+
+### Simple built-in Webhooks
+You can also configure the controller to dispatch alerts directly by setting the `--webhook-url` flag. When a pod crashes, the controller immediately dispatches a JSON payload (or formatted Slack message for Slack endpoints) directly to your destination:
 ```
 🚨 Pod Crash Detected
 Pod: default/oom-victim (container: hogger)
