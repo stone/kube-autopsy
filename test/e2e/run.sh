@@ -15,6 +15,7 @@
 #   ./test/e2e/run.sh              # Full run (create cluster, test, cleanup)
 #   ./test/e2e/run.sh --no-cleanup # Keep cluster after test for debugging
 #   CLUSTER_NAME=my-test ./test/e2e/run.sh  # Custom cluster name
+#   OVERLAY=hardened ./test/e2e/run.sh      # Test the least-privilege overlay
 #
 set -euo pipefail
 
@@ -30,6 +31,7 @@ KIND_CONFIG="${SCRIPT_DIR}/kind-config.yaml"
 TEST_PODS="${SCRIPT_DIR}/testdata/test-pods.yaml"
 TIMEOUT_REPORT="${TIMEOUT_REPORT:-120}"    # seconds to wait for crash reports
 TIMEOUT_POD="${TIMEOUT_POD:-60}"           # seconds to wait for pods to start
+OVERLAY="${OVERLAY:-quickstart}"
 CLEANUP="${1:-}"
 
 # Colors for output
@@ -165,28 +167,16 @@ phase_build_image() {
 phase_deploy() {
     header "Phase 3: Deploy kube-autopsy"
 
-    log "Applying CRD..."
-    kubectl apply -f "${PROJECT_ROOT}/deploy/base/crd.yaml"
-    ok "CRD applied"
-
-    log "Applying namespace, RBAC, and service account..."
-    kubectl apply -f "${PROJECT_ROOT}/deploy/base/namespace.yaml"
-    kubectl apply -f "${PROJECT_ROOT}/deploy/base/serviceaccount.yaml"
-    kubectl apply -f "${PROJECT_ROOT}/deploy/base/clusterrole.yaml"
-    kubectl apply -f "${PROJECT_ROOT}/deploy/base/clusterrolebinding.yaml"
-    ok "RBAC applied"
-
-    # Patch manifests to use the e2e image (instead of ghcr.io/stone/kube-autopsy:latest)
-    log "Deploying controller..."
-    sed -E "s|ghcr.io/stone/kube-autopsy:latest|${IMAGE_NAME}|g; s|kube-autopsy:latest|${IMAGE_NAME}|g" "${PROJECT_ROOT}/deploy/base/deployment.yaml" \
+    # Deploy the overlay users actually install, rather than hand-applying
+    # individual files: that way the e2e exercises the real kustomization and
+    # catches breakage in it. OVERLAY can be set to "hardened" to test the
+    # least-privilege posture instead.
+    log "Rendering the '${OVERLAY}' overlay with the e2e image..."
+    kubectl kustomize "${PROJECT_ROOT}/deploy/overlays/${OVERLAY}" \
+        | sed -E "s|ghcr.io/stone/kube-autopsy:latest|${IMAGE_NAME}|g" \
         | sed 's/--leader-elect=true/--leader-elect=false/' \
         | kubectl apply -f -
-    ok "Controller deployed"
-
-    log "Deploying DaemonSet agent..."
-    sed -E "s|ghcr.io/stone/kube-autopsy:latest|${IMAGE_NAME}|g; s|kube-autopsy:latest|${IMAGE_NAME}|g" "${PROJECT_ROOT}/deploy/base/daemonset.yaml" \
-        | kubectl apply -f -
-    ok "DaemonSet applied"
+    ok "Overlay '${OVERLAY}' applied"
 
     log "Waiting for controller to be ready..."
     wait_for_condition "Controller ready" 60 \
@@ -267,14 +257,24 @@ phase_verify_reports() {
         oom_container=$(echo "$oom_report" | jq -r '.spec.containerName')
         oom_phase=$(echo "$oom_report" | jq -r '.status.phase // empty')
         oom_log_count=$(echo "$oom_report" | jq -r '.status.diagnostics.lastLogLines | length')
-        oom_peak=$(echo "$oom_report" | jq -r '.status.diagnostics.peakMemoryBytes')
+        oom_rss=$(echo "$oom_report" | jq -r '.status.diagnostics.victimRssBytes // 0')
+        oom_limit=$(echo "$oom_report" | jq -r '.status.diagnostics.oomScopeLimitBytes // 0')
 
         assert_contains "terminationReason is OOMKilled" "$oom_reason" "OOMKilled"
         assert "exitCode is 137" test "$oom_exit" = "137"
         assert "containerName is 'hogger'" test "$oom_container" = "hogger"
         assert "status.phase is set" test -n "$oom_phase"
-        assert "lastLogLines captured (count > 0)" test "$oom_log_count" -gt 0
-        assert "peakMemoryBytes captured (> 0)" test "$oom_peak" -gt 0
+        # Log capture is on in the quickstart overlay and off in hardened, so
+        # this is only asserted where it is actually expected.
+        if [ "${OVERLAY}" = "quickstart" ]; then
+            assert "lastLogLines captured (count > 0)" test "$oom_log_count" -gt 0
+        else
+            assert "lastLogLines withheld when capture is disabled" test "${oom_log_count:-0}" -eq 0
+        fi
+        assert "victimRssBytes captured (> 0)" test "$oom_rss" -gt 0
+        assert "oomScopeLimitBytes captured (> 0)" test "$oom_limit" -gt 0
+        # The victim cannot have been using more than the scope it was killed in.
+        assert "victimRssBytes <= oomScopeLimitBytes" test "$oom_rss" -le "$oom_limit"
 
         echo
         log "OOM victim report (YAML):"
@@ -298,6 +298,69 @@ phase_verify_reports() {
         local multi_container
         multi_container=$(echo "$multi_report" | jq -r '.spec.containerName')
         assert "containerName is 'main-app' (not sidecar)" test "$multi_container" = "main-app"
+    fi
+
+    # -----------------------------------------------------------------------
+    # Test 2b: Repeated OOM kills produce one report per kill
+    #
+    # Regression coverage: a deterministic report name meant the second and all
+    # later OOM kills of a container collided with the first report and were
+    # dropped, so a CrashLoopBackOff recorded exactly one report ever.
+    # -----------------------------------------------------------------------
+    header "Test 2b: Repeated OOM kills"
+
+    log "Waiting for repeat-oom-victim to be restarted at least twice..."
+    wait_for_condition "repeat-oom-victim restarted >= 2 times" "${TIMEOUT_REPORT}" \
+        bash -c "[ \"\$(kubectl get pod repeat-oom-victim -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo 0)\" -ge 2 ]" \
+        || warn "repeat-oom-victim did not restart twice in time"
+
+    # Allow the agent to publish the reports for the observed restarts.
+    sleep 15
+
+    local repeat_count
+    repeat_count=$(kubectl get podcrashreports --all-namespaces -o json 2>/dev/null \
+        | jq -r '[.items[] | select(.spec.podName == "repeat-oom-victim")] | length')
+
+    assert "repeat-oom-victim produced more than one report (got ${repeat_count})" \
+        test "${repeat_count:-0}" -gt 1
+
+    # Every report must carry a real detection time, not the zero value.
+    local zero_timestamps
+    zero_timestamps=$(kubectl get podcrashreports --all-namespaces -o json 2>/dev/null \
+        | jq -r '[.items[] | select(.spec.timestamp | startswith("0001-01-01"))] | length')
+
+    assert "no report has a zero-value spec.timestamp (got ${zero_timestamps})" \
+        test "${zero_timestamps:-1}" -eq 0
+
+    # -----------------------------------------------------------------------
+    # Test 2c: Labels, podUID and parsed log lines
+    # -----------------------------------------------------------------------
+    header "Test 2c: Report metadata"
+
+    # Labels allow server-side selection; names are server-generated and opaque.
+    local by_label
+    by_label=$(kubectl get pcr -n default -l "autopsy.tty.se/pod=oom-victim" -o name 2>/dev/null | wc -l)
+    assert "oom-victim reports are selectable by label (got ${by_label})" \
+        test "${by_label:-0}" -ge 1
+
+    if [ -n "$oom_report" ]; then
+        local oom_uid oom_first_log
+        oom_uid=$(echo "$oom_report" | jq -r '.spec.podUID // empty')
+        assert "spec.podUID is populated" test -n "$oom_uid"
+
+        # Log lines must have the CRI framing removed: a raw line would start
+        # with an RFC3339 timestamp followed by "stdout F".
+        if [ "${OVERLAY}" = "quickstart" ]; then
+            oom_first_log=$(echo "$oom_report" | jq -r '.status.diagnostics.lastLogLines[0] // empty')
+            TESTS_TOTAL=$((TESTS_TOTAL + 1))
+            if echo "$oom_first_log" | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T.* (stdout|stderr) [FP] '; then
+                fail "FAIL: log lines still carry CRI framing: ${oom_first_log}"
+                TESTS_FAILED=$((TESTS_FAILED + 1))
+            else
+                ok "PASS: log lines have CRI framing stripped"
+                TESTS_PASSED=$((TESTS_PASSED + 1))
+            fi
+        fi
     fi
 
     # -----------------------------------------------------------------------
@@ -414,6 +477,7 @@ main() {
     header "kube-autopsy e2e test"
     log "Cluster: ${CLUSTER_NAME}"
     log "Image:   ${IMAGE_NAME}"
+    log "Overlay: ${OVERLAY}"
     log "Project: ${PROJECT_ROOT}"
     echo
 
