@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "${unformatted}" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "${unformatted}"
+            exit 1
+          fi
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Build
+        run: go build ./...
+
+      # The agent embeds an architecture-specific eBPF object, so cross-arch
+      # compilation is checked explicitly rather than assumed.
+      - name: Build (linux/arm64)
+        run: GOOS=linux GOARCH=arm64 go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # Without these the CO-RE relocation tests skip, and a regression in the
+      # eBPF program's kernel-version handling would go unnoticed.
+      - name: Fetch kernel BTF fixtures
+        run: make btf-fixtures
+
+      - name: Test
+        run: go test ./... -race -count=1
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9.0.0
+        with:
+          version: latest
+
+  # The eBPF object is a committed binary embedded into the agent, so a change
+  # to it ships kernel-level code with no source-level review signal. This
+  # rebuilds it from oom.c and fails if the generated Go bindings differ.
+  #
+  # Only the bindings are compared, not the .o: LLVM does not produce a
+  # byte-identical object across compiler versions, but the struct layout and
+  # symbol names that userspace depends on must not drift.
+  bpf:
+    name: eBPF object is reproducible from source
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: Install eBPF toolchain
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang llvm libbpf-dev
+
+      - name: Regenerate eBPF objects
+        run: make generate-bpf
+
+      - name: Fail if the generated bindings drifted from oom.c
+        run: git diff --exit-code -- 'internal/agent/bpf/*.go'
+
+  # Regenerating the CRD must be a no-op; otherwise deploy/base/crd.yaml has
+  # drifted from the Go types and clusters run an out-of-date schema.
+  manifests:
+    name: Generated manifests are up to date
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: Install controller-gen
+        run: go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.21.0
+
+      - name: Regenerate CRDs
+        run: PATH="$PATH:$(go env GOPATH)/bin" make generate
+
+      - name: Fail if the CRD drifted from the Go types
+        run: git diff --exit-code -- deploy/base/crd.yaml
+
+  vulncheck:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.0
+
+      - name: Set up Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...

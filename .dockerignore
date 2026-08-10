@@ -1,0 +1,16 @@
+# Keep the build context small and reproducible. Without this, `COPY . .` drags
+# in the git history and the multi-megabyte kernel BTF test fixtures, none of
+# which the binary needs.
+.git
+.github
+bin/
+deploy/
+docs/
+integrations/
+test/
+internal/agent/bpf/testdata/
+*.md
+LICENSE
+Makefile
+install.yaml
+sbom.spdx.json

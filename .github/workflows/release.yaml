@@ -63,6 +63,9 @@ jobs:
         with:
           context: .
           push: true
+          # The agent ships an architecture-specific eBPF object, so each
+          # platform must be built rather than assumed portable.
+          platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
@@ -84,7 +87,7 @@ jobs:
       - name: Setup kubectl
         uses: azure/setup-kubectl@v5.1.0
 
-      - name: Build Kubernetes Manifest
+      - name: Build Kubernetes Manifests
         run: |
           VERSION="${{ github.ref_name }}"
           cat <<EOF >> deploy/base/kustomization.yaml
@@ -93,7 +96,10 @@ jobs:
               newName: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
               newTag: ${VERSION#v}
           EOF
-          kubectl kustomize deploy/base > install.yaml
+          # Two published manifests: install.yaml is the one-command quickstart,
+          # install-hardened.yaml is the least-privilege variant.
+          kubectl kustomize deploy/overlays/quickstart > install.yaml
+          kubectl kustomize deploy/overlays/hardened   > install-hardened.yaml
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3.0.2
@@ -102,3 +108,4 @@ jobs:
           files: |
             sbom.spdx.json
             install.yaml
+            install-hardened.yaml
