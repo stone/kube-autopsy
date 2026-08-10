@@ -1,15 +1,56 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: kube-autopsy-rolebinding
+  name: kube-autopsy-agent
+  labels:
+    app.kubernetes.io/name: kube-autopsy
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: kube-autopsy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-autopsy-agent
+subjects:
+  - kind: ServiceAccount
+    name: kube-autopsy-agent
+    namespace: kube-autopsy
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-autopsy-controller
+  labels:
+    app.kubernetes.io/name: kube-autopsy
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: kube-autopsy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-autopsy-controller
+subjects:
+  # The agent is deliberately NOT a subject here: it must not be able to read,
+  # update or delete crash reports.
+  - kind: ServiceAccount
+    name: kube-autopsy-controller
+    namespace: kube-autopsy
+---
+# Both components serve an authenticating metrics endpoint, so both need to be
+# able to verify scraper tokens. This grants nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-autopsy-metrics-auth
   labels:
     app.kubernetes.io/name: kube-autopsy
     app.kubernetes.io/part-of: kube-autopsy
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: kube-autopsy-role
+  name: kube-autopsy-metrics-auth
 subjects:
   - kind: ServiceAccount
-    name: kube-autopsy
+    name: kube-autopsy-controller
+    namespace: kube-autopsy
+  - kind: ServiceAccount
+    name: kube-autopsy-agent
     namespace: kube-autopsy

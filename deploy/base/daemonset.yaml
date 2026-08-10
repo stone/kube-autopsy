@@ -19,12 +19,25 @@ spec:
         app.kubernetes.io/component: agent
         app.kubernetes.io/part-of: kube-autopsy
     spec:
-      serviceAccountName: kube-autopsy
-      hostPID: true
+      serviceAccountName: kube-autopsy-agent
+      # An OOM diagnostic tool is useless on the nodes it cannot reach, and
+      # control-plane and dedicated nodes are exactly where an unexplained OOM
+      # is most costly. Without this the agent silently skips every tainted node.
+      tolerations:
+        - operator: Exists
+      # The agent must outlive the workloads it is diagnosing; without this it
+      # is itself an eviction and OOM candidate.
+      priorityClassName: system-node-critical
       containers:
         - name: agent
           image: ghcr.io/stone/kube-autopsy:latest
+          # Releases pin a version tag; override with a digest for immutability.
+          imagePullPolicy: IfNotPresent
           args: ["agent"]
+          ports:
+            - name: metrics
+              containerPort: 8443
+              protocol: TCP
           env:
             - name: NODE_NAME
               valueFrom:
@@ -38,34 +51,36 @@ spec:
               cpu: 200m
               memory: 128Mi
           securityContext:
-            privileged: true
+            # Loading BPF programs and attaching kprobes needs only these
+            # capabilities on Linux 5.8 and newer. Running fully privileged
+            # additionally disables seccomp and exposes every host device, which
+            # this agent has no use for. On kernels older than 5.8, CAP_BPF and
+            # CAP_PERFMON do not exist — the quickstart overlay patches this back
+            # to privileged for exactly that reason.
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - BPF
+                - PERFMON
+                # Only needed below 5.11, where BPF maps are charged against
+                # RLIMIT_MEMLOCK. Harmless on newer kernels.
+                - SYS_RESOURCE
+            privileged: false
+            # Capabilities granted at start are unaffected by this; it only
+            # blocks acquiring further privileges via setuid binaries.
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            seccompProfile:
+              type: RuntimeDefault
           volumeMounts:
-            - name: cgroup
-              mountPath: /sys/fs/cgroup
-              readOnly: true
+            # Container log files, read only when --capture-logs is enabled.
             - name: pod-logs
               mountPath: /var/log/pods
               readOnly: true
-            - name: host-proc
-              mountPath: /host-proc
-              readOnly: true
-            - name: debugfs
-              mountPath: /sys/kernel/debug
       volumes:
-        - name: cgroup
-          hostPath:
-            path: /sys/fs/cgroup
-            type: Directory
         - name: pod-logs
           hostPath:
             path: /var/log/pods
-            type: Directory
-        - name: host-proc
-          hostPath:
-            path: /proc
-            type: Directory
-        - name: debugfs
-          hostPath:
-            path: /sys/kernel/debug
             type: Directory
       terminationGracePeriodSeconds: 30

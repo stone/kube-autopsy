@@ -65,6 +65,8 @@ spec:
             properties:
               containerName:
                 description: ContainerName is the specific container that crashed.
+                maxLength: 253
+                minLength: 1
                 type: string
               exitCode:
                 description: ExitCode is the container's exit code.
@@ -72,19 +74,34 @@ spec:
                 type: integer
               namespace:
                 description: Namespace is the namespace of the crashed pod.
+                maxLength: 63
+                minLength: 1
                 type: string
               nodeName:
                 description: NodeName is the node where the pod was running.
+                maxLength: 253
                 type: string
               podName:
                 description: PodName is the name of the crashed pod.
+                maxLength: 253
+                minLength: 1
+                type: string
+              podUID:
+                description: |-
+                  PodUID identifies the specific pod incarnation that crashed. A pod name
+                  is reused across restarts and recreations, so without this a report
+                  cannot be attributed to the exact pod it came from.
+                maxLength: 36
                 type: string
               terminationReason:
-                description: Termination is the reason for termination (e.g., OOMKilled,
-                  Error).
+                description: TerminationReason is the reason for termination.
+                enum:
+                - OOMKilled
+                - Error
                 type: string
               timestamp:
-                description: Timestamp is the ISO 8601 time of the crash event.
+                description: Timestamp is the time the crash was detected.
+                format: date-time
                 type: string
             required:
             - containerName
@@ -102,18 +119,40 @@ spec:
                 description: Diagnostics contains the captured diagnostic data.
                 properties:
                   lastLogLines:
-                    description: LastLogLines are the final log lines captured before
-                      container termination.
+                    description: |-
+                      LastLogLines are the final log lines captured before container
+                      termination. Only populated when the agent runs with --capture-logs.
+
+                      The bounds are enforced by the API server as well as by the agent: a
+                      report that grows past etcd's per-object limit cannot be written at all,
+                      which would lose every other diagnostic alongside the logs.
                     items:
+                      maxLength: 4096
                       type: string
+                    maxItems: 200
                     type: array
                   oomContext:
                     description: OOMContext categorizes if the OOM was ContainerLimit
                       or NodeExhaustion.
+                    enum:
+                    - ContainerLimit
+                    - NodeExhaustion
                     type: string
+                  oomScopeLimitBytes:
+                    description: |-
+                      OOMScopeLimitBytes is the total memory available to the scope the OOM
+                      killer was operating in: the container's memory limit for an OOM caused
+                      by ContainerLimit, or the node's total RAM for NodeExhaustion. It is a
+                      capacity, not a measure of what the victim was using — see
+                      VictimRSSBytes for that.
+                    format: int64
+                    type: integer
                   oomScore:
-                    description: OOMScore is the kernel's calculated OOM score.
-                    format: int32
+                    description: |-
+                      OOMScore is the kernel's "badness" score for the victim, in pages. This
+                      is oom_control's chosen_points, not the 0-1000 value that
+                      /proc/<pid>/oom_score reports.
+                    format: int64
                     type: integer
                   oomScoreAdj:
                     description: OOMScoreAdj is the adjustment score applied to the
@@ -129,14 +168,10 @@ spec:
                       the OOM killer.
                     format: int32
                     type: integer
-                  peakMemoryBytes:
-                    description: PeakMemoryBytes is the peak memory usage from cgroup
-                      memory.peak.
-                    format: int64
-                    type: integer
                   rssDissection:
-                    description: RSSDissection contains the memory breakdown at the
-                      time of OOM.
+                    description: |-
+                      RSSDissection contains the memory breakdown at the time of OOM. It is
+                      omitted when the running kernel's memory layout was not recognised.
                     properties:
                       anonRssBytes:
                         format: int64
@@ -157,9 +192,28 @@ spec:
                       the OOM.
                     format: int32
                     type: integer
+                  victimRssBytes:
+                    description: |-
+                      VictimRSSBytes is the victim's resident set size (anonymous plus
+                      file-backed) at the moment the OOM killer selected it. It is omitted when
+                      the running kernel's memory layout was not recognised.
+                    format: int64
+                    type: integer
                 type: object
+              notifiedAt:
+                description: |-
+                  NotifiedAt records when a webhook notification was delivered, so a
+                  delivery is not repeated once it has succeeded.
+                format: date-time
+                type: string
               phase:
-                description: 'Phase indicates the processing state: Pending or Processed.'
+                description: |-
+                  Phase indicates the processing state. It is empty until the agent has
+                  attached diagnostics, which is how the controller knows not to process a
+                  report that is still being written.
+                enum:
+                - Pending
+                - Processed
                 type: string
             type: object
         type: object

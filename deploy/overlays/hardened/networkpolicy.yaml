@@ -1,0 +1,47 @@
+# Default-deny ingress for the namespace, with an explicit hole for metrics and
+# health checks. Neither component accepts any other inbound traffic. Both the
+# controller and the DaemonSet agent serve metrics, so the allow rule selects
+# every kube-autopsy pod.
+#
+# NOTE: NetworkPolicy is enforced only by a CNI that implements it. On a cluster
+# without one (or with it disabled) these objects are accepted and ignored, so
+# they are a defence-in-depth measure rather than a guarantee.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kube-autopsy-default-deny-ingress
+  namespace: kube-autopsy
+  labels:
+    app.kubernetes.io/name: kube-autopsy
+    app.kubernetes.io/part-of: kube-autopsy
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kube-autopsy-allow-metrics
+  namespace: kube-autopsy
+  labels:
+    app.kubernetes.io/name: kube-autopsy
+    app.kubernetes.io/part-of: kube-autopsy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kube-autopsy
+  policyTypes:
+    - Ingress
+  ingress:
+    # Scrapes still have to authenticate and pass a SubjectAccessReview; this
+    # only controls who may open the connection. Narrow the peer to your
+    # monitoring namespace if you want defence in depth at the network layer.
+    - ports:
+        - port: 8443
+          protocol: TCP
+    # The kubelet performs health checks from the node, which has no pod labels
+    # to select on, so this port is left open to the cluster.
+    - ports:
+        - port: 8081
+          protocol: TCP

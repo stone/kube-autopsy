@@ -1,0 +1,44 @@
+# Without a Service there is no stable name to scrape; previously the metrics
+# port was reachable only via the pod IP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-autopsy-controller-metrics
+  namespace: kube-autopsy
+  labels:
+    app.kubernetes.io/name: kube-autopsy
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: kube-autopsy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: kube-autopsy
+    app.kubernetes.io/component: controller
+  ports:
+    - name: metrics
+      port: 8443
+      targetPort: metrics
+      protocol: TCP
+---
+# Headless: the agent is a DaemonSet, so scrapers need per-pod endpoints rather
+# than a single load-balanced address.
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-autopsy-agent-metrics
+  namespace: kube-autopsy
+  labels:
+    app.kubernetes.io/name: kube-autopsy
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: kube-autopsy
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: kube-autopsy
+    app.kubernetes.io/component: agent
+  ports:
+    - name: metrics
+      port: 8443
+      targetPort: metrics
+      protocol: TCP

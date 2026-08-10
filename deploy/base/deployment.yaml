@@ -20,14 +20,32 @@ spec:
         app.kubernetes.io/component: controller
         app.kubernetes.io/part-of: kube-autopsy
     spec:
-      serviceAccountName: kube-autopsy
+      serviceAccountName: kube-autopsy-controller
       containers:
         - name: controller
           image: ghcr.io/stone/kube-autopsy:latest
+          # Releases pin a version tag; override with a digest for immutability.
+          imagePullPolicy: IfNotPresent
           args: ["controller", "--leader-elect=true"]
+          env:
+            # The webhook URL is a credential: supplying it here from a Secret
+            # keeps it out of the pod spec, where a flag value would be readable
+            # by anyone who can get pods. Create the Secret to enable webhooks.
+            - name: KUBE_AUTOPSY_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: kube-autopsy-webhook
+                  key: url
+                  optional: true
+            - name: KUBE_AUTOPSY_WEBHOOK_AUTH_HEADER
+              valueFrom:
+                secretKeyRef:
+                  name: kube-autopsy-webhook
+                  key: authHeader
+                  optional: true
           ports:
             - name: metrics
-              containerPort: 8080
+              containerPort: 8443
               protocol: TCP
             - name: health
               containerPort: 8081
@@ -56,6 +74,8 @@ spec:
             runAsNonRoot: true
             runAsUser: 65532
             allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
             capabilities:
               drop:
                 - ALL

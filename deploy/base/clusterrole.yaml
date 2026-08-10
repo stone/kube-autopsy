@@ -1,26 +1,72 @@
+# Each component is granted only what its code actually calls. Notably absent
+# compared with earlier versions: "pods/log" and "nodes", which no code path
+# ever used, and the agent's ability to delete reports or touch leases.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: kube-autopsy-role
+  name: kube-autopsy-agent
+  labels:
+    app.kubernetes.io/name: kube-autopsy
+    app.kubernetes.io/component: agent
+    app.kubernetes.io/part-of: kube-autopsy
+rules:
+  # Resolves the crashed cgroup to a pod. Cluster-scoped because the agent's
+  # informer is filtered by spec.nodeName rather than by namespace.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Creates reports and attaches diagnostics. The agent never reads, updates or
+  # deletes an existing report.
+  - apiGroups: ["autopsy.tty.se"]
+    resources: ["podcrashreports"]
+    verbs: ["create"]
+  - apiGroups: ["autopsy.tty.se"]
+    resources: ["podcrashreports/status"]
+    verbs: ["update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-autopsy-controller
+  labels:
+    app.kubernetes.io/name: kube-autopsy
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: kube-autopsy
+rules:
+  - apiGroups: ["autopsy.tty.se"]
+    resources: ["podcrashreports"]
+    verbs: ["get", "list", "watch", "update", "patch", "delete"]
+  - apiGroups: ["autopsy.tty.se"]
+    resources: ["podcrashreports/status"]
+    verbs: ["update", "patch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+# Required by the authenticating metrics endpoint to verify scraper tokens.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-autopsy-metrics-auth
   labels:
     app.kubernetes.io/name: kube-autopsy
     app.kubernetes.io/part-of: kube-autopsy
 rules:
-  - apiGroups: [""]
-    resources: ["pods", "pods/log"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create", "patch"]
-  - apiGroups: [""]
-    resources: ["nodes"]
-    verbs: ["get", "list"]
-  - apiGroups: ["autopsy.tty.se"]
-    resources: ["podcrashreports"]
-    verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
-  - apiGroups: ["autopsy.tty.se"]
-    resources: ["podcrashreports/status"]
-    verbs: ["update", "patch"]
-  - apiGroups: ["coordination.k8s.io"]
-    resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+---
+# Grantable to a Prometheus ServiceAccount so it may scrape /metrics.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-autopsy-metrics-reader
+  labels:
+    app.kubernetes.io/name: kube-autopsy
+    app.kubernetes.io/part-of: kube-autopsy
+rules:
+  - nonResourceURLs: ["/metrics"]
+    verbs: ["get"]
