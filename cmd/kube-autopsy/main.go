@@ -7,18 +7,18 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	autopsyv1alpha1 "github.com/kube-autopsy/kube-autopsy/api/v1alpha1"
@@ -58,8 +58,26 @@ func main() {
 	}
 }
 
+// metricsOptions builds the metrics server configuration shared by both
+// subcommands. By default the endpoint is served over TLS and every scrape must
+// carry a token that passes authentication and a SubjectAccessReview; served in
+// the clear it exposes namespace, node, container and process names to anything
+// that can reach the pod.
+func metricsOptions(cfg *config.Config) metricsserver.Options {
+	opts := metricsserver.Options{BindAddress: cfg.MetricsBindAddr}
+	if cfg.MetricsSecure {
+		opts.SecureServing = true
+		opts.FilterProvider = filters.WithAuthenticationAndAuthorization
+	}
+	return opts
+}
+
 func runAgent() {
+	// Precedence is flag > env > default: environment variables are applied
+	// first so that BindFlags registers them as the flag defaults, letting an
+	// explicitly passed flag win.
 	cfg := config.NewConfig()
+	cfg.LoadFromEnv()
 
 	fs := flag.CommandLine
 	cfg.BindFlags(fs)
@@ -68,9 +86,12 @@ func runAgent() {
 	opts.BindFlags(fs)
 	flag.Parse()
 
-	cfg.LoadFromEnv()
-
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if err := cfg.Validate(); err != nil {
+		setupLog.Error(err, "invalid configuration")
+		os.Exit(1)
+	}
 
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName == "" {
@@ -80,11 +101,24 @@ func runAgent() {
 
 	setupLog.Info("starting kube-autopsy agent", "node", nodeName)
 
-	// Create a minimal manager for the Kubernetes client.
+	// Create a minimal manager for the Kubernetes client. The pod informer is
+	// restricted to this node: without this the agent on every node would watch
+	// and cache every pod in the cluster, which does not fit in the DaemonSet's
+	// memory limit on large clusters and multiplies load on the API server.
+	// Capture latency and log-capture failures are the agent's own signals and
+	// cannot be observed from the controller, so the agent serves metrics too.
+	agent.RegisterMetrics()
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme: scheme,
-		// Disable metrics and health probes for the agent; the controller handles those.
-		Metrics: metricsserver.Options{BindAddress: "0"},
+		Scheme:  scheme,
+		Metrics: metricsOptions(cfg),
+		Cache: cache.Options{
+			ByObject: map[client.Object]cache.ByObject{
+				&corev1.Pod{}: {
+					Field: fields.OneTermEqualSelector("spec.nodeName", nodeName),
+				},
+			},
+		},
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to create manager")
@@ -100,9 +134,9 @@ func runAgent() {
 		os.Exit(1)
 	}
 
-	// Set up signal-aware context for graceful shutdown.
-	ctx, cancel := signal.NotifyContext(ctrl.SetupSignalHandler(), syscall.SIGTERM, syscall.SIGINT)
-	defer cancel()
+	// SetupSignalHandler already cancels on SIGTERM/SIGINT (and hard-exits on a
+	// second signal), so no additional signal plumbing is needed here.
+	ctx := ctrl.SetupSignalHandler()
 
 	a := agent.NewAgent(mgr.GetClient(), cfg, nodeName)
 
@@ -129,7 +163,9 @@ func runAgent() {
 }
 
 func runController() {
+	// Precedence is flag > env > default; see runAgent.
 	cfg := config.NewConfig()
+	cfg.LoadFromEnv()
 
 	fs := flag.CommandLine
 	cfg.BindFlags(fs)
@@ -138,9 +174,12 @@ func runController() {
 	opts.BindFlags(fs)
 	flag.Parse()
 
-	cfg.LoadFromEnv()
-
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	if err := cfg.Validate(); err != nil {
+		setupLog.Error(err, "invalid configuration")
+		os.Exit(1)
+	}
 
 	setupLog.Info("starting kube-autopsy controller")
 
@@ -148,7 +187,7 @@ func runController() {
 		Scheme:                 scheme,
 		LeaderElection:         cfg.LeaderElect,
 		LeaderElectionID:       "kube-autopsy-leader",
-		Metrics:                metricsserver.Options{BindAddress: cfg.MetricsBindAddr},
+		Metrics:                metricsOptions(cfg),
 		HealthProbeBindAddress: cfg.HealthProbeBindAddr,
 	})
 	if err != nil {
@@ -162,8 +201,16 @@ func runController() {
 	// Set up the webhook sender if configured.
 	var webhookSender *controller.WebhookSender
 	if cfg.WebhookURL != "" {
-		webhookSender = controller.NewWebhookSender(cfg.WebhookURL)
-		setupLog.Info("webhook notifications enabled", "url", cfg.WebhookURL)
+		if cfg.WebhookURLFromFlag(fs) {
+			setupLog.Info("WARNING: --webhook-url is deprecated because a flag value is " +
+				"visible in the pod spec to anyone who can read pods. Set the " +
+				"KUBE_AUTOPSY_WEBHOOK_URL environment variable from a Secret instead")
+		}
+		webhookSender = controller.NewWebhookSender(cfg.WebhookURL, cfg.WebhookAuthHeader, cfg.WebhookIncludeLogs)
+		// The URL itself is a credential, so it is never logged.
+		setupLog.Info("webhook notifications enabled",
+			"authHeaderSet", cfg.WebhookAuthHeader != "",
+			"includeLogs", cfg.WebhookIncludeLogs)
 	}
 
 	// Set up the PodCrashReport reconciler.
@@ -190,17 +237,14 @@ func runController() {
 	}
 
 	// Register the garbage collector as a Runnable with the manager.
-	gc := controller.NewGarbageCollector(mgr.GetClient(), time.Duration(cfg.TTLHours)*time.Hour)
+	gc := controller.NewGarbageCollector(mgr.GetClient(), cfg.TTLDuration())
 	if err := mgr.Add(gc); err != nil {
 		setupLog.Error(err, "unable to set up garbage collector")
 		os.Exit(1)
 	}
 
-	ctx, cancel := signal.NotifyContext(ctrl.SetupSignalHandler(), syscall.SIGTERM, syscall.SIGINT)
-	defer cancel()
-
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctx); err != nil {
+	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "manager exited with error")
 		os.Exit(1)
 	}

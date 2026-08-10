@@ -16,8 +16,19 @@ func TestNewConfig(t *testing.T) {
 	if cfg.LogTailLines != 50 {
 		t.Errorf("expected default LogTailLines to be 50, got %d", cfg.LogTailLines)
 	}
-	if cfg.MetricsBindAddr != ":8080" {
-		t.Errorf("expected default MetricsBindAddr to be :8080, got %s", cfg.MetricsBindAddr)
+	if cfg.MetricsBindAddr != ":8443" {
+		t.Errorf("expected default MetricsBindAddr to be :8443, got %s", cfg.MetricsBindAddr)
+	}
+	if !cfg.MetricsSecure {
+		t.Error("expected metrics to be served securely by default")
+	}
+	// Log content is sensitive, so capture must be opt-in and must not leave
+	// the cluster unless explicitly allowed.
+	if cfg.CaptureLogs {
+		t.Error("expected CaptureLogs to default to false")
+	}
+	if cfg.WebhookIncludeLogs {
+		t.Error("expected WebhookIncludeLogs to default to false")
 	}
 	if !cfg.LeaderElect {
 		t.Error("expected default LeaderElect to be true")
@@ -99,5 +110,62 @@ func TestTTLDuration(t *testing.T) {
 	expected := 2 * time.Hour
 	if got := cfg.TTLDuration(); got != expected {
 		t.Errorf("expected TTLDuration %v, got %v", expected, got)
+	}
+}
+
+func TestValidate(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr bool
+	}{
+		{
+			name:    "defaults are valid",
+			mutate:  func(*Config) {},
+			wantErr: false,
+		},
+		{
+			name:    "zero ttl-hours would GC every report immediately",
+			mutate:  func(c *Config) { c.TTLHours = 0 },
+			wantErr: true,
+		},
+		{
+			name:    "negative ttl-hours",
+			mutate:  func(c *Config) { c.TTLHours = -1 },
+			wantErr: true,
+		},
+		{
+			name:    "zero log-tail-lines",
+			mutate:  func(c *Config) { c.LogTailLines = 0 },
+			wantErr: true,
+		},
+		{
+			name:    "negative log-tail-lines used to panic the agent",
+			mutate:  func(c *Config) { c.LogTailLines = -1 },
+			wantErr: true,
+		},
+		{
+			name: "reports every invalid field at once",
+			mutate: func(c *Config) {
+				c.TTLHours = 0
+				c.LogTailLines = 0
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := NewConfig()
+			tt.mutate(cfg)
+
+			err := cfg.Validate()
+			if tt.wantErr && err == nil {
+				t.Errorf("Validate() = nil, want error")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("Validate() = %v, want nil", err)
+			}
+		})
 	}
 }

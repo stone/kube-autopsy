@@ -1,0 +1,3 @@
+# Kernel BTF blobs are several megabytes each and are fetched on demand.
+# See the `btf-fixtures` Makefile target.
+*.btf

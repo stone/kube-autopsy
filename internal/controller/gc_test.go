@@ -55,7 +55,7 @@ func TestDeleteExpiredReports(t *testing.T) {
 
 	// Inject the metrics registerer to prevent panic if tests run in parallel
 	// though they are globally registered in metrics.go, no setup needed for this basic test.
-	
+
 	deleted, err := gc.deleteExpiredReports(context.Background())
 	if err != nil {
 		t.Fatalf("deleteExpiredReports failed: %v", err)
