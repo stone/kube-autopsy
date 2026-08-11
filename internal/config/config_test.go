@@ -2,7 +2,6 @@ package config
 
 import (
 	"flag"
-	"os"
 	"testing"
 	"time"
 )
@@ -68,21 +67,12 @@ func TestBindFlags(t *testing.T) {
 func TestLoadFromEnv(t *testing.T) {
 	cfg := NewConfig()
 
-	// Set environment variables
-	os.Setenv("KUBE_AUTOPSY_TTL_HOURS", "72")
-	os.Setenv("KUBE_AUTOPSY_LOG_TAIL_LINES", "200")
-	os.Setenv("KUBE_AUTOPSY_METRICS_BIND_ADDR", ":9091")
-	os.Setenv("KUBE_AUTOPSY_WEBHOOK_URL", "https://hooks.slack.com/test")
-	os.Setenv("KUBE_AUTOPSY_LEADER_ELECT", "false")
-
-	// Cleanup environment variables after test
-	defer func() {
-		os.Unsetenv("KUBE_AUTOPSY_TTL_HOURS")
-		os.Unsetenv("KUBE_AUTOPSY_LOG_TAIL_LINES")
-		os.Unsetenv("KUBE_AUTOPSY_METRICS_BIND_ADDR")
-		os.Unsetenv("KUBE_AUTOPSY_WEBHOOK_URL")
-		os.Unsetenv("KUBE_AUTOPSY_LEADER_ELECT")
-	}()
+	// t.Setenv restores the previous values when the test finishes.
+	t.Setenv("KUBE_AUTOPSY_TTL_HOURS", "72")
+	t.Setenv("KUBE_AUTOPSY_LOG_TAIL_LINES", "200")
+	t.Setenv("KUBE_AUTOPSY_METRICS_BIND_ADDR", ":9091")
+	t.Setenv("KUBE_AUTOPSY_WEBHOOK_URL", "https://hooks.slack.com/test")
+	t.Setenv("KUBE_AUTOPSY_LEADER_ELECT", "false")
 
 	cfg.LoadFromEnv()
 

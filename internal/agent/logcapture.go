@@ -290,7 +290,8 @@ func tailFile(path string, lines int) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open %s: %w", path, err)
 	}
-	defer f.Close()
+	// Read-only handle, so there is no deferred write for Close to report.
+	defer func() { _ = f.Close() }()
 
 	stat, err := f.Stat()
 	if err != nil {

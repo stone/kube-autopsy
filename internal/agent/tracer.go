@@ -57,14 +57,16 @@ func NewOOMTracer() (*OOMTracer, error) {
 
 	kp, err := link.Kprobe(oomKillSymbol, objs.KprobeOomKillProcess, nil)
 	if err != nil {
-		objs.Close()
+		// Cleanup errors are discarded: the attach failure below is the one
+		// worth reporting.
+		_ = objs.Close()
 		return nil, fmt.Errorf("attaching kprobe to %s: %w%s", oomKillSymbol, err, kprobeHint())
 	}
 
 	rd, err := ringbuf.NewReader(objs.Events)
 	if err != nil {
-		kp.Close()
-		objs.Close()
+		_ = kp.Close()
+		_ = objs.Close()
 		return nil, fmt.Errorf("creating ringbuf reader: %w", err)
 	}
 
@@ -113,19 +115,19 @@ func kprobeHint() string {
 // Close removes the eBPF programs from the kernel and frees resources.
 func (t *OOMTracer) Close() {
 	if t.reader != nil {
-		t.reader.Close()
+		_ = t.reader.Close()
 	}
 	if t.kprobe != nil {
-		t.kprobe.Close()
+		_ = t.kprobe.Close()
 	}
-	t.objs.Close()
+	_ = t.objs.Close()
 }
 
 // ReadEvent blocks until an OOM event is received from the kernel, or until ctx
 // is cancelled. Cancellation closes the ring buffer reader, which unblocks this
 // and every subsequent read with ringbuf.ErrClosed.
 func (t *OOMTracer) ReadEvent(ctx context.Context) (*bpf.BpfOomEvent, error) {
-	stop := context.AfterFunc(ctx, func() { t.reader.Close() })
+	stop := context.AfterFunc(ctx, func() { _ = t.reader.Close() })
 	defer stop()
 
 	record, err := t.reader.Read()

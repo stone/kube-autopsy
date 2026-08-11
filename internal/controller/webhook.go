@@ -137,7 +137,7 @@ func (ws *WebhookSender) Send(ctx context.Context, report *v1alpha1.PodCrashRepo
 		logger.Error(err, "Failed to send webhook", "url", ws.redactedURL())
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	// Drain the body to allow connection reuse.
 	_, _ = io.Copy(io.Discard, resp.Body)
 
