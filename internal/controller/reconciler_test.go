@@ -10,7 +10,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -47,7 +47,7 @@ func TestReconcileEmitsEvent(t *testing.T) {
 		WithStatusSubresource(report).
 		Build()
 
-	fakeRecorder := record.NewFakeRecorder(10)
+	fakeRecorder := events.NewFakeRecorder(10)
 	cfg := config.NewConfig()
 
 	reconciler := &PodCrashReportReconciler{
@@ -81,7 +81,7 @@ func TestReconcileEmitsEvent(t *testing.T) {
 }
 
 // newReportForReconcile builds a report and a reconciler wired to a fake client.
-func newReportForReconcile(t *testing.T, report *v1alpha1.PodCrashReport) (*PodCrashReportReconciler, *record.FakeRecorder) {
+func newReportForReconcile(t *testing.T, report *v1alpha1.PodCrashReport) (*PodCrashReportReconciler, *events.FakeRecorder) {
 	t.Helper()
 
 	scheme := runtime.NewScheme()
@@ -95,7 +95,7 @@ func newReportForReconcile(t *testing.T, report *v1alpha1.PodCrashReport) (*PodC
 		WithStatusSubresource(report).
 		Build()
 
-	recorder := record.NewFakeRecorder(10)
+	recorder := events.NewFakeRecorder(10)
 	return &PodCrashReportReconciler{
 		Client:   fakeClient,
 		Scheme:   scheme,

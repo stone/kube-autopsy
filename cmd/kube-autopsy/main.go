@@ -219,7 +219,7 @@ func runController() {
 		Scheme:        mgr.GetScheme(),
 		Config:        cfg,
 		WebhookSender: webhookSender,
-		Recorder:      mgr.GetEventRecorderFor("kube-autopsy-controller"),
+		Recorder:      mgr.GetEventRecorder("kube-autopsy-controller"),
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up PodCrashReport reconciler")

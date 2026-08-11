@@ -39,6 +39,12 @@ rules:
   - apiGroups: ["autopsy.tty.se"]
     resources: ["podcrashreports/status"]
     verbs: ["update", "patch"]
+  # Crash Events are recorded through the events.k8s.io API. The core group is
+  # still required because controller-runtime's leader election emits its own
+  # events through the older core/v1 API.
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
   - apiGroups: [""]
     resources: ["events"]
     verbs: ["create", "patch"]

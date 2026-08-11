@@ -8,7 +8,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -43,7 +43,7 @@ type PodCrashReportReconciler struct {
 	Scheme        *runtime.Scheme
 	Config        *config.Config
 	WebhookSender *WebhookSender
-	Recorder      record.EventRecorder
+	Recorder      events.EventRecorder
 }
 
 // Reconcile handles a single PodCrashReport reconciliation cycle. Reports that
@@ -53,6 +53,10 @@ type PodCrashReportReconciler struct {
 //
 // +kubebuilder:rbac:groups=autopsy.tty.se,resources=podcrashreports,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=autopsy.tty.se,resources=podcrashreports/status,verbs=update;patch
+// The controller records Events through the events.k8s.io API. The core group
+// is still needed because controller-runtime's leader election emits its
+// events through the older core/v1 API.
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 func (r *PodCrashReportReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -132,8 +136,9 @@ func (r *PodCrashReportReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		"exitCode", report.Spec.ExitCode,
 	)
 
-	// Record a Kubernetes Event on the PodCrashReport resource.
-	r.Recorder.Eventf(&report, "Warning", "CrashDetected",
+	// Record a Kubernetes Event on the PodCrashReport resource. There is no
+	// second, related object to attribute the event to, so "related" is nil.
+	r.Recorder.Eventf(&report, nil, "Warning", "CrashDetected", "ProcessReport",
 		"Processed crash report for pod %s/%s (container: %s, reason: %s, exit code: %d)",
 		report.Spec.Namespace, report.Spec.PodName,
 		report.Spec.ContainerName, report.Spec.TerminationReason, report.Spec.ExitCode,
