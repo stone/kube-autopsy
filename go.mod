@@ -1,6 +1,6 @@
 module github.com/kube-autopsy/kube-autopsy
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/cilium/ebpf v0.22.0
