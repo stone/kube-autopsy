@@ -28,7 +28,8 @@ plugins:
         "OOM Context: \(.status.diagnostics.oomContext)",
         "Trigger Process: \(.status.diagnostics.triggerComm) (PID: \(.status.diagnostics.triggerPid))",
         "Victim Process: \(.status.diagnostics.oomVictimComm) (PID: \(.status.diagnostics.oomVictimPid))",
-        "Peak Memory (MB): \(.status.diagnostics.peakMemoryBytes / 1024 / 1024 | floor)",
+        "Victim RSS (MB): \(.status.diagnostics.victimRssBytes // 0 / 1024 / 1024 | floor)",
+        "OOM Scope Limit (MB): \(.status.diagnostics.oomScopeLimitBytes // 0 / 1024 / 1024 | floor)",
         "---",
         "Anon RSS (Bytes): \(.status.diagnostics.rssDissection.anonRssBytes)",
         "File RSS (Bytes): \(.status.diagnostics.rssDissection.fileRssBytes)",
@@ -47,9 +48,12 @@ plugins:
     args:
       - -c
       - |
-        REPORT=$(kubectl get pcr -n $NAMESPACE -o json | jq -r ".items[] | select(.spec.podName==\"$NAME\") | .metadata.name" | head -n 1)
+        # Selected server-side by label, and sorted so the most recent crash of a
+        # repeatedly-killed container is the one shown.
+        REPORT=$(kubectl get pcr -n $NAMESPACE -l "autopsy.tty.se/pod=$NAME" \
+          --sort-by=.metadata.creationTimestamp -o name | tail -n 1)
         if [ -z "$REPORT" ]; then
           echo "No PodCrashReport found for pod $NAME in namespace $NAMESPACE" | less
         else
-          kubectl get pcr $REPORT -n $NAMESPACE -o yaml | less
+          kubectl get $REPORT -n $NAMESPACE -o yaml | less
         fi

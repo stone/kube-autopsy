@@ -1,6 +1,20 @@
 // +build ignore
 
 #include "vmlinux.h"
+
+#if defined(__TARGET_ARCH_arm64)
+// vmlinux.h is dumped from an x86_64 kernel, where "struct user_pt_regs" is
+// only forward-declared. arm64's PT_REGS_PARM* macros dereference it, so the
+// type has to be complete here. This is the arm64 UAPI definition from
+// uapi/asm/ptrace.h, which is frozen ABI and cannot change.
+struct user_pt_regs {
+    __u64 regs[31];
+    __u64 sp;
+    __u64 pc;
+    __u64 pstate;
+};
+#endif
+
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
@@ -11,19 +25,49 @@ struct oom_event {
     u32 fpid;         // Trigger process PID
     u32 tpid;         // Victim process PID
     u64 cgroup_id;    // Victim cgroup ID
-    u16 oom_score;    // Victim OOM score
-    short oom_score_adj; // Victim OOM score adjustment
-    char fcomm[16];   // Trigger command name
-    char tcomm[16];   // Victim command name
-    u64 pages;        // Total pages (approx memory)
-    u64 anon_rss;     // Anonymous RSS bytes
-    u64 file_rss;     // File RSS bytes
-    u64 pgtables;     // Page tables bytes
+    // Kernel "badness" points for the victim, in pages. This is oom_control's
+    // chosen_points, not the 0..1000 value exposed as /proc/<pid>/oom_score.
+    s64 oom_score;
+    s16 oom_score_adj;   // Victim OOM score adjustment
+    char fcomm[16];      // Trigger command name
+    char tcomm[16];      // Victim command name
+    // Total pages available to the OOM scope: the memcg limit for a container
+    // OOM, or the node's total RAM for a global OOM. This is a capacity, NOT
+    // the victim's consumption.
+    u64 scope_total_pages;
+    u64 anon_rss_pages;  // Victim anonymous RSS, in pages
+    u64 file_rss_pages;  // Victim file-backed RSS, in pages
+    u64 pgtables_bytes;  // Victim page tables, already in bytes
     char cgroup_name[128]; // Cgroup directory name
-    bool is_global_oom; // True if node exhaustion
+    bool is_global_oom;  // True if node exhaustion
+    // False when the running kernel's mm_struct layout was not recognised, in
+    // which case the RSS page counts above are meaningless and must be ignored.
+    bool rss_valid;
 };
 
 const struct oom_event *unused __attribute__((unused));
+
+// Linux 6.2 (commit f1a7941243c1 "mm: convert mm's rss stats into
+// percpu_counter") replaced
+//
+//     struct mm_rss_stat { atomic_long_t count[NR_MM_COUNTERS]; } rss_stat;
+//
+// with
+//
+//     struct percpu_counter rss_stat[NR_MM_COUNTERS];
+//
+// vmlinux.h describes the newer layout, so the older one is declared here as a
+// CO-RE flavor: the "___pre62" suffix is stripped during relocation, so these
+// match the kernel's "mm_rss_stat" and "mm_struct" when the target actually has
+// them. Without this, kernels older than 6.2 (RHEL 9, Ubuntu 22.04, Amazon
+// Linux 2023) silently produce no RSS figures at all.
+struct mm_rss_stat___pre62 {
+    atomic_long_t count[NR_MM_COUNTERS];
+};
+
+struct mm_struct___pre62 {
+    struct mm_rss_stat___pre62 rss_stat;
+};
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -35,7 +79,6 @@ int BPF_KPROBE(kprobe__oom_kill_process, struct oom_control *oc, const char *mes
 {
     struct oom_event *event;
     struct task_struct *victim = NULL;
-    struct task_struct *current_task = (struct task_struct *)bpf_get_current_task();
     struct mm_struct *mm = NULL;
 
     // Read victim task from oom_control
@@ -50,6 +93,11 @@ int BPF_KPROBE(kprobe__oom_kill_process, struct oom_control *oc, const char *mes
         return 0; // Ringbuf full
     }
 
+    // bpf_ringbuf_reserve does not zero the reservation, and several fields
+    // below are only written conditionally. Without this, a field that is not
+    // populated would carry stale bytes from a previous event.
+    __builtin_memset(event, 0, sizeof(*event));
+
     // Populate trigger process details
     event->fpid = bpf_get_current_pid_tgid() >> 32;
     bpf_get_current_comm(&event->fcomm, sizeof(event->fcomm));
@@ -62,38 +110,58 @@ int BPF_KPROBE(kprobe__oom_kill_process, struct oom_control *oc, const char *mes
     struct signal_struct *sig = NULL;
     bpf_core_read(&sig, sizeof(sig), &victim->signal);
     if (sig) {
-        bpf_core_read(&event->oom_score_adj, sizeof(event->oom_score_adj), &sig->oom_score_adj);
+        s16 score_adj = 0;
+        bpf_core_read(&score_adj, sizeof(score_adj), &sig->oom_score_adj);
+        event->oom_score_adj = score_adj;
     }
-    
-    long chosen_points = 0;
-    bpf_core_read(&chosen_points, sizeof(chosen_points), &oc->chosen_points);
-    event->oom_score = (u16)chosen_points;
 
-    // Victim total pages from oom_control
-    bpf_core_read(&event->pages, sizeof(event->pages), &oc->totalpages);
+    // chosen_points is a full-width long: truncating it loses the score
+    // entirely for any victim larger than about 256MB.
+    s64 chosen_points = 0;
+    bpf_core_read(&chosen_points, sizeof(chosen_points), &oc->chosen_points);
+    event->oom_score = chosen_points;
+
+    // Capacity of the OOM scope, in pages.
+    bpf_core_read(&event->scope_total_pages, sizeof(event->scope_total_pages), &oc->totalpages);
 
     // Global vs Container limit
     struct mem_cgroup *memcg = NULL;
     bpf_core_read(&memcg, sizeof(memcg), &oc->memcg);
     event->is_global_oom = (memcg == NULL);
 
-    // Victim Memory details (approximate from mm_struct)
+    // Victim memory details from mm_struct.
     bpf_core_read(&mm, sizeof(mm), &victim->mm);
     if (mm) {
-        // Read page tables bytes
+        // pgtables_bytes is a byte count, not a page count.
         long pgtables_bytes = 0;
         bpf_core_read(&pgtables_bytes, sizeof(pgtables_bytes), &mm->pgtables_bytes.counter);
-        event->pgtables = (u64)pgtables_bytes;
+        event->pgtables_bytes = (u64)pgtables_bytes;
 
-        struct percpu_counter file_pages = {};
-        struct percpu_counter anon_pages = {};
-        
-        if (bpf_core_field_exists(mm->rss_stat[0])) {
-            bpf_core_read(&file_pages, sizeof(file_pages), &mm->rss_stat[0]);
-            bpf_core_read(&anon_pages, sizeof(anon_pages), &mm->rss_stat[1]);
-            
-            event->file_rss = (u64)file_pages.count * 4096;
-            event->anon_rss = (u64)anon_pages.count * 4096;
+        if (bpf_core_type_exists(struct mm_rss_stat___pre62)) {
+            // Kernel < 6.2: an array of atomic counters, in pages.
+            struct mm_struct___pre62 *mm_old = (struct mm_struct___pre62 *)mm;
+            long count = 0;
+
+            bpf_core_read(&count, sizeof(count), &mm_old->rss_stat.count[MM_FILEPAGES]);
+            event->file_rss_pages = (u64)count;
+
+            bpf_core_read(&count, sizeof(count), &mm_old->rss_stat.count[MM_ANONPAGES]);
+            event->anon_rss_pages = (u64)count;
+
+            event->rss_valid = true;
+        } else if (bpf_core_field_exists(mm->rss_stat)) {
+            // Kernel >= 6.2: percpu_counter array. Reading .count gives the
+            // batched total and omits the unflushed per-CPU deltas, so the
+            // figure is approximate by up to a few pages per CPU.
+            s64 count = 0;
+
+            bpf_core_read(&count, sizeof(count), &mm->rss_stat[MM_FILEPAGES].count);
+            event->file_rss_pages = (u64)count;
+
+            bpf_core_read(&count, sizeof(count), &mm->rss_stat[MM_ANONPAGES].count);
+            event->anon_rss_pages = (u64)count;
+
+            event->rss_valid = true;
         }
     }
 

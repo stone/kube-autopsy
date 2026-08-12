@@ -110,3 +110,37 @@ spec:
           memory: "64Mi"
         requests:
           memory: "64Mi"
+---
+# Regression coverage for repeated OOM kills of the same container.
+# restartPolicy: Always means the container is OOM killed, restarted, and OOM
+# killed again — which must produce a distinct PodCrashReport per kill.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: repeat-oom-victim
+  namespace: default
+  labels:
+    app: repeat-oom-victim
+    test: kube-autopsy-e2e
+spec:
+  restartPolicy: Always
+  containers:
+    - name: repeat-hogger
+      image: alpine:3.20
+      command:
+        - sh
+        - -c
+        - |
+          echo "=== repeated OOM test ==="
+          i=0
+          while true; do
+            block=$(dd if=/dev/urandom bs=65536 count=16 2>/dev/null | base64)
+            eval "mem_$i=\$block"
+            i=$((i + 1))
+            echo "Allocated block $i"
+          done
+      resources:
+        limits:
+          memory: "64Mi"
+        requests:
+          memory: "64Mi"

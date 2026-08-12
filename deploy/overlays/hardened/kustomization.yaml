@@ -1,0 +1,24 @@
+# Hardened: least privilege, suitable for a shared or multi-tenant cluster.
+#
+# This is the base as-is plus NetworkPolicies. The base already:
+#   * runs the agent unprivileged with CAP_BPF, CAP_PERFMON and CAP_SYS_RESOURCE,
+#     seccompProfile RuntimeDefault, a read-only root filesystem and no host PID
+#     namespace, mounting only /var/log/pods read-only;
+#   * gives the agent and controller separate ServiceAccounts, so compromising
+#     the node-resident agent does not grant the ability to delete reports;
+#   * serves metrics over TLS, requiring each scrape to authenticate and pass a
+#     SubjectAccessReview;
+#   * leaves container log capture off, so report readers cannot see application
+#     log content they could not otherwise read.
+#
+# Requires Linux 5.8 or newer on every node for CAP_BPF and CAP_PERFMON. On
+# older kernels use the quickstart overlay, or patch the agent back to
+# privileged, otherwise the agent will fail to load its eBPF program.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: kube-autopsy
+
+resources:
+  - ../../base
+  - networkpolicy.yaml

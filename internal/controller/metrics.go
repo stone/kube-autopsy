@@ -3,8 +3,105 @@
 package controller
 
 import (
+	"strings"
+	"sync"
+	"unicode"
+	"unicode/utf8"
+
 	"github.com/prometheus/client_golang/prometheus"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+)
+
+const (
+	// maxLabelCardinality bounds how many distinct values a tenant-influenced
+	// label may take before further values collapse into overflowLabel. A
+	// process name comes straight from the victim's comm, which any workload
+	// can set to anything it likes via prctl(PR_SET_NAME) and change at will —
+	// without a bound, a pod that OOMs in a loop under rotating names creates
+	// unbounded time series and can exhaust Prometheus's memory.
+	maxLabelCardinality = 100
+
+	// overflowLabel replaces a value once maxLabelCardinality is reached.
+	overflowLabel = "other"
+
+	// unknownLabel replaces an empty value, since an empty label is
+	// indistinguishable from an absent one in most queries.
+	unknownLabel = "unknown"
+
+	// maxLabelValueLength caps a single label value. comm is 16 bytes, but
+	// nothing guarantees that for other sources.
+	maxLabelValueLength = 64
+)
+
+// labelLimiter bounds the set of distinct values a metric label may take.
+type labelLimiter struct {
+	mu   sync.Mutex
+	seen map[string]struct{}
+}
+
+func newLabelLimiter() *labelLimiter {
+	return &labelLimiter{seen: make(map[string]struct{})}
+}
+
+// bound sanitizes value and collapses it to overflowLabel once the limiter has
+// already admitted maxLabelCardinality distinct values.
+func (l *labelLimiter) bound(value string) string {
+	value = sanitizeLabelValue(value)
+	if value == unknownLabel {
+		return value
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if _, ok := l.seen[value]; ok {
+		return value
+	}
+	if len(l.seen) >= maxLabelCardinality {
+		return overflowLabel
+	}
+	l.seen[value] = struct{}{}
+	return value
+}
+
+// sanitizeLabelValue makes a kernel-supplied string safe to use as a Prometheus
+// label value. comm is raw bytes from the kernel, so it is not necessarily
+// valid UTF-8, and invalid UTF-8 corrupts the entire /metrics exposition rather
+// than just this one series.
+func sanitizeLabelValue(value string) string {
+	if value == "" {
+		return unknownLabel
+	}
+
+	if len(value) > maxLabelValueLength {
+		value = value[:maxLabelValueLength]
+	}
+
+	var b strings.Builder
+	b.Grow(len(value))
+	for _, r := range value {
+		switch {
+		case r == utf8.RuneError:
+			b.WriteByte('_')
+		case unicode.IsPrint(r):
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+
+	if out := b.String(); out != "" {
+		return out
+	}
+	return unknownLabel
+}
+
+var (
+	// triggerCommLimiter bounds the tenant-controlled process-name label.
+	triggerCommLimiter = newLabelLimiter()
+	// containerNameLimiter bounds the container-name label, which is chosen by
+	// whoever can create pods.
+	containerNameLimiter = newLabelLimiter()
 )
 
 var (
@@ -38,32 +135,12 @@ var (
 		},
 	)
 
-	// CaptureLatencySeconds observes the latency (in seconds) from event
-	// detection to CRD creation.
-	CaptureLatencySeconds = prometheus.NewHistogram(
-		prometheus.HistogramOpts{
-			Name:    "kube_autopsy_capture_latency_seconds",
-			Help:    "Time from event detection to PodCrashReport creation in seconds.",
-			Buckets: []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
-		},
-	)
-
-	// LogCaptureFailuresTotal counts the number of failed log tail attempts,
-	// partitioned by namespace.
-	LogCaptureFailuresTotal = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "kube_autopsy_log_capture_failures_total",
-			Help: "Total number of failed log tail attempts.",
-		},
-		[]string{"namespace"},
-	)
-
 	// VictimAnonRSSBytes observes the Anonymous RSS footprint of the victim.
 	VictimAnonRSSBytes = prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
-			Name: "kube_autopsy_victim_anon_rss_bytes",
-			Help: "Anonymous RSS footprint of the OOM victim in bytes.",
-			Buckets: []float64{1024*1024*10, 1024*1024*50, 1024*1024*100, 1024*1024*500, 1024*1024*1024, 1024*1024*1024*5}, // 10M, 50M, 100M, 500M, 1G, 5G
+			Name:    "kube_autopsy_victim_anon_rss_bytes",
+			Help:    "Anonymous RSS footprint of the OOM victim in bytes.",
+			Buckets: []float64{1024 * 1024 * 10, 1024 * 1024 * 50, 1024 * 1024 * 100, 1024 * 1024 * 500, 1024 * 1024 * 1024, 1024 * 1024 * 1024 * 5}, // 10M, 50M, 100M, 500M, 1G, 5G
 		},
 		[]string{"namespace", "container"},
 	)
@@ -85,8 +162,6 @@ func RegisterMetrics() {
 		ReportsCreatedTotal,
 		OOMEventsTotal,
 		ReportAgeSeconds,
-		CaptureLatencySeconds,
-		LogCaptureFailuresTotal,
 		VictimAnonRSSBytes,
 		TriggerProcessesTotal,
 	)

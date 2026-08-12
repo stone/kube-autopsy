@@ -1,0 +1,33 @@
+# Leader election leases live in the controller's own namespace, so this is a
+# namespaced Role rather than a ClusterRole.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kube-autopsy-leader-election
+  namespace: kube-autopsy
+  labels:
+    app.kubernetes.io/name: kube-autopsy
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: kube-autopsy
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kube-autopsy-leader-election
+  namespace: kube-autopsy
+  labels:
+    app.kubernetes.io/name: kube-autopsy
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/part-of: kube-autopsy
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kube-autopsy-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: kube-autopsy-controller
+    namespace: kube-autopsy

@@ -7,36 +7,90 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// Label keys applied to every PodCrashReport, so reports can be selected
+// server-side instead of by filtering the whole collection client-side.
+const (
+	LabelPod       = "autopsy.tty.se/pod"
+	LabelContainer = "autopsy.tty.se/container"
+	LabelNode      = "autopsy.tty.se/node"
+	LabelReason    = "autopsy.tty.se/reason"
+)
+
+// Termination reasons.
+const (
+	TerminationOOMKilled = "OOMKilled"
+	TerminationError     = "Error"
+)
+
+// Processing phases.
+const (
+	PhasePending   = "Pending"
+	PhaseProcessed = "Processed"
+)
+
+// OOM scope classifications.
+const (
+	OOMContextContainerLimit = "ContainerLimit"
+	OOMContextNodeExhaustion = "NodeExhaustion"
+)
+
 // PodCrashReportSpec defines the desired state of PodCrashReport.
 type PodCrashReportSpec struct {
 	// PodName is the name of the crashed pod.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
 	PodName string `json:"podName"`
+	// PodUID identifies the specific pod incarnation that crashed. A pod name
+	// is reused across restarts and recreations, so without this a report
+	// cannot be attributed to the exact pod it came from.
+	// +kubebuilder:validation:MaxLength=36
+	PodUID string `json:"podUID,omitempty"`
 	// Namespace is the namespace of the crashed pod.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
 	Namespace string `json:"namespace"`
 	// ContainerName is the specific container that crashed.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
 	ContainerName string `json:"containerName"`
 	// NodeName is the node where the pod was running.
+	// +kubebuilder:validation:MaxLength=253
 	NodeName string `json:"nodeName"`
-	// Termination is the reason for termination (e.g., OOMKilled, Error).
-	Termination string `json:"terminationReason"`
+	// TerminationReason is the reason for termination.
+	// +kubebuilder:validation:Enum=OOMKilled;Error
+	TerminationReason string `json:"terminationReason"`
 	// ExitCode is the container's exit code.
 	ExitCode int32 `json:"exitCode"`
-	// Timestamp is the ISO 8601 time of the crash event.
-	Timestamp string `json:"timestamp"`
+	// Timestamp is the time the crash was detected.
+	Timestamp metav1.Time `json:"timestamp"`
 }
 
 // PodCrashReportStatus defines the observed state of PodCrashReport.
 type PodCrashReportStatus struct {
 	// Diagnostics contains the captured diagnostic data.
 	Diagnostics DiagnosticData `json:"diagnostics,omitempty"`
-	// Phase indicates the processing state: Pending or Processed.
+	// Phase indicates the processing state. It is empty until the agent has
+	// attached diagnostics, which is how the controller knows not to process a
+	// report that is still being written.
+	// +kubebuilder:validation:Enum=Pending;Processed
 	Phase string `json:"phase,omitempty"`
+	// NotifiedAt records when a webhook notification was delivered, so a
+	// delivery is not repeated once it has succeeded.
+	NotifiedAt *metav1.Time `json:"notifiedAt,omitempty"`
 }
 
 // DiagnosticData contains captured system-level diagnostic information.
 type DiagnosticData struct {
-	// PeakMemoryBytes is the peak memory usage from cgroup memory.peak.
-	PeakMemoryBytes int64 `json:"peakMemoryBytes,omitempty"`
+	// OOMScopeLimitBytes is the total memory available to the scope the OOM
+	// killer was operating in: the container's memory limit for an OOM caused
+	// by ContainerLimit, or the node's total RAM for NodeExhaustion. It is a
+	// capacity, not a measure of what the victim was using — see
+	// VictimRSSBytes for that.
+	OOMScopeLimitBytes int64 `json:"oomScopeLimitBytes,omitempty"`
+	// VictimRSSBytes is the victim's resident set size (anonymous plus
+	// file-backed) at the moment the OOM killer selected it. It is omitted when
+	// the running kernel's memory layout was not recognised.
+	VictimRSSBytes int64 `json:"victimRssBytes,omitempty"`
 	// OOMVictimPID is the PID of the process killed by the OOM killer.
 	OOMVictimPID int32 `json:"oomVictimPid,omitempty"`
 	// OOMVictimComm is the process name of the OOM victim (e.g., "java", "node").
@@ -45,15 +99,26 @@ type DiagnosticData struct {
 	TriggerPID int32 `json:"triggerPid,omitempty"`
 	// TriggerComm is the name of the process that triggered the OOM.
 	TriggerComm string `json:"triggerComm,omitempty"`
-	// OOMScore is the kernel's calculated OOM score.
-	OOMScore int32 `json:"oomScore,omitempty"`
+	// OOMScore is the kernel's "badness" score for the victim, in pages. This
+	// is oom_control's chosen_points, not the 0-1000 value that
+	// /proc/<pid>/oom_score reports.
+	OOMScore int64 `json:"oomScore,omitempty"`
 	// OOMScoreAdj is the adjustment score applied to the victim.
 	OOMScoreAdj int32 `json:"oomScoreAdj,omitempty"`
-	// RSSDissection contains the memory breakdown at the time of OOM.
+	// RSSDissection contains the memory breakdown at the time of OOM. It is
+	// omitted when the running kernel's memory layout was not recognised.
 	RSSDissection *RSSDissection `json:"rssDissection,omitempty"`
 	// OOMContext categorizes if the OOM was ContainerLimit or NodeExhaustion.
+	// +kubebuilder:validation:Enum=ContainerLimit;NodeExhaustion
 	OOMContext string `json:"oomContext,omitempty"`
-	// LastLogLines are the final log lines captured before container termination.
+	// LastLogLines are the final log lines captured before container
+	// termination. Only populated when the agent runs with --capture-logs.
+	//
+	// The bounds are enforced by the API server as well as by the agent: a
+	// report that grows past etcd's per-object limit cannot be written at all,
+	// which would lose every other diagnostic alongside the logs.
+	// +kubebuilder:validation:MaxItems=200
+	// +kubebuilder:validation:items:MaxLength=4096
 	LastLogLines []string `json:"lastLogLines,omitempty"`
 }
 

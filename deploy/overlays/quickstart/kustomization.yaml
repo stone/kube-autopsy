@@ -1,0 +1,67 @@
+# Quickstart: optimised for "it works on the first try", not for least privilege.
+#
+# Relative to the base it makes three trade-offs, each of which removes a common
+# reason for a first install to fail or to look broken:
+#
+#   1. The agent runs privileged, so it loads on kernels older than 5.8 (where
+#      CAP_BPF and CAP_PERFMON do not exist) and inside nested runtimes such as
+#      kind, minikube and Docker Desktop.
+#   2. Metrics are served in plain HTTP on :8080, so Prometheus can scrape them
+#      without a ServiceAccount token or extra RBAC.
+#   3. Container log capture is on, so the first report you look at contains the
+#      last-gasp logs the tool is advertised for.
+#
+# Trade-off 3 is the one to think about before leaving it on: it lets anyone who
+# can read PodCrashReports read application log content, which normally requires
+# "get pods/log". See deploy/overlays/hardened for the opposite set of choices.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: kube-autopsy
+
+resources:
+  - ../../base
+
+patches:
+  - target:
+      kind: DaemonSet
+      name: kube-autopsy-agent
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          privileged: true
+          readOnlyRootFilesystem: true
+      - op: replace
+        path: /spec/template/spec/containers/0/args
+        value: ["agent", "--capture-logs=true", "--metrics-secure=false", "--metrics-bind-addr=:8080"]
+      - op: replace
+        path: /spec/template/spec/containers/0/ports/0/containerPort
+        value: 8080
+
+  - target:
+      kind: Deployment
+      name: kube-autopsy-controller
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/args
+        value: ["controller", "--leader-elect=true", "--metrics-secure=false", "--metrics-bind-addr=:8080"]
+      - op: replace
+        path: /spec/template/spec/containers/0/ports/0/containerPort
+        value: 8080
+
+  - target:
+      kind: Service
+      name: kube-autopsy-controller-metrics
+    patch: |-
+      - op: replace
+        path: /spec/ports/0/port
+        value: 8080
+
+  - target:
+      kind: Service
+      name: kube-autopsy-agent-metrics
+    patch: |-
+      - op: replace
+        path: /spec/ports/0/port
+        value: 8080
