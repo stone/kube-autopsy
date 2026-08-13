@@ -52,11 +52,12 @@ spec:
               memory: 128Mi
           securityContext:
             # Loading BPF programs and attaching kprobes needs only these
-            # capabilities on Linux 5.8 and newer. Running fully privileged
-            # additionally disables seccomp and exposes every host device, which
-            # this agent has no use for. On kernels older than 5.8, CAP_BPF and
-            # CAP_PERFMON do not exist — the quickstart overlay patches this back
-            # to privileged for exactly that reason.
+            # capabilities on Linux 5.8 and newer, which is the agent's minimum
+            # kernel anyway. Running fully privileged additionally disables
+            # seccomp and exposes every host device, which this agent has no use
+            # for — the quickstart overlay patches this back to privileged only
+            # to get past sandboxed and nested runtimes that deny bpf(2) to a
+            # capable-but-unprivileged process.
             capabilities:
               drop:
                 - ALL

@@ -1,7 +1,9 @@
 // Package agent implements the DaemonSet node agent for kube-autopsy.
-// It monitors cgroup v2 memory events to detect OOM kills and captures
-// diagnostic data (memory stats, log tails) before the container runtime
-// cleans up the cgroup and log directories.
+// It detects OOM kills by attaching an eBPF kprobe to the kernel's
+// oom_kill_process, rather than by polling cgroup memory.events, which reports
+// that a kill happened but not who triggered it or what the victim was using.
+// The diagnostic data (memory stats, log tails) is captured before the container
+// runtime cleans up the cgroup and log directories.
 package agent
 
 import (
@@ -100,8 +102,9 @@ type CrashEvent struct {
 }
 
 // Agent is the main DaemonSet agent that runs on each node. It watches for
-// cgroup v2 OOM kill events and creates PodCrashReport CRDs with captured
-// diagnostic data.
+// kernel OOM kill events, resolves each one to the pod owning the victim's
+// cgroup v2 scope, and creates PodCrashReport CRDs with captured diagnostic
+// data.
 type Agent struct {
 	client   client.Client
 	cfg      *config.Config

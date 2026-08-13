@@ -3,9 +3,12 @@
 # Relative to the base it makes three trade-offs, each of which removes a common
 # reason for a first install to fail or to look broken:
 #
-#   1. The agent runs privileged, so it loads on kernels older than 5.8 (where
-#      CAP_BPF and CAP_PERFMON do not exist) and inside nested runtimes such as
-#      kind, minikube and Docker Desktop.
+#   1. The agent runs privileged, so it loads inside nested and locked-down
+#      runtimes such as kind, minikube and Docker Desktop, and on hosts whose
+#      seccomp or AppArmor policy denies bpf(2) to a merely capable process.
+#      Note this does not lower the Linux 5.8 floor the whole agent has: the
+#      ring buffer it streams events over does not exist before then, so on an
+#      older kernel the program fails to load however privileged it is.
 #   2. Metrics are served in plain HTTP on :8080, so Prometheus can scrape them
 #      without a ServiceAccount token or extra RBAC.
 #   3. Container log capture is on, so the first report you look at contains the

@@ -11,9 +11,10 @@
 #   * leaves container log capture off, so report readers cannot see application
 #     log content they could not otherwise read.
 #
-# Requires Linux 5.8 or newer on every node for CAP_BPF and CAP_PERFMON. On
-# older kernels use the quickstart overlay, or patch the agent back to
-# privileged, otherwise the agent will fail to load its eBPF program.
+# CAP_BPF and CAP_PERFMON require Linux 5.8 or newer on every node. That is the
+# same floor the agent already has from its BPF ring buffer, so it rules out no
+# kernel the quickstart overlay would have supported — on a pre-5.8 node neither
+# overlay can load the program.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
