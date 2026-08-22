@@ -37,8 +37,8 @@ graph TD
 | `triggerComm`, `triggerPid` | The process whose allocation breached the limit. |
 | `oomVictimComm`, `oomVictimPid` | The process the kernel chose to kill. |
 | `oomScore`, `oomScoreAdj` | The victim's badness points and the bias applied. `oomScore` is `oom_control`'s `chosen_points` in pages, not the 0-1000 value in `/proc/<pid>/oom_score`. |
-| `victimRssBytes` | Resident memory (anonymous plus file-backed) the victim was using when selected. |
-| `rssDissection` | Byte-precise split of that: anonymous RSS, file RSS, page tables. |
+| `victimRssBytes` | Resident memory the victim was using when selected — anonymous, file-backed and shared, matching the kernel's own `get_mm_rss()`. |
+| `rssDissection` | Byte-precise split of that: anonymous, file-backed and shared RSS, plus swap and page tables. Anon + file + shmem is `victimRssBytes`; adding swap and page tables gives the figure the kernel scored the victim on. |
 | `oomScopeLimitBytes` | Memory available to the scope that OOMed — the container's limit, or node RAM for a `NodeExhaustion` kill. A capacity, not a usage figure. |
 | `oomContext` | `ContainerLimit` (the cgroup limit was hit) or `NodeExhaustion` (the node ran out). |
 | `lastLogLines` | The container's final log lines, 50 by default. Captured by the quickstart manifest only — see [Log capture and access control](docs/security.md#log-capture-and-access-control). |
@@ -51,7 +51,9 @@ graph TD
 * **Linux 5.8+** on every node, for both manifests: events are streamed over a
   BPF ring buffer, which earlier kernels do not have, so the program will not
   load however privileged the agent is.
-* **cgroups v2** (unified hierarchy).
+* **cgroups v2** (unified hierarchy). The agent checks this at startup and
+  refuses to run on v1 rather than tracing kills it could never attribute to a
+  pod.
 * Kernel BTF at `/sys/kernel/btf/vmlinux`, i.e. `CONFIG_DEBUG_INFO_BTF=y`, which
   CO-RE requires; the agent says so at startup if it is missing. Debian 11+,
   Ubuntu 20.10+, RHEL 8.2+ and Amazon Linux 2023 all ship it. This is separate

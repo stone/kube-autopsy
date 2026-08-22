@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -46,6 +48,10 @@ type WebhookSender struct {
 	authHeader  string
 	includeLogs bool
 	client      *http.Client
+	// forceSlackFormat selects the Slack message shape regardless of the URL's
+	// host. isSlackURL keys on the hostname, which a test server cannot supply,
+	// so this exists to make that branch reachable in tests.
+	forceSlackFormat bool
 }
 
 // NewWebhookSender creates a new WebhookSender for the given URL. If url is
@@ -72,6 +78,8 @@ func NewWebhookSender(url, authHeader string, includeLogs bool) *WebhookSender {
 // Errors are logged but not returned to avoid failing reconciliation.
 func (ws *WebhookSender) Send(ctx context.Context, report *v1alpha1.PodCrashReport) error {
 	logger := log.FromContext(ctx)
+	start := time.Now()
+	defer func() { WebhookDurationSeconds.Observe(time.Since(start).Seconds()) }()
 
 	payload := WebhookPayload{
 		PodName:         report.Spec.PodName,
@@ -93,7 +101,7 @@ func (ws *WebhookSender) Send(ctx context.Context, report *v1alpha1.PodCrashRepo
 	var body []byte
 	var err error
 
-	if isSlackURL(ws.url) {
+	if ws.forceSlackFormat || isSlackURL(ws.url) {
 		text := fmt.Sprintf(
 			":rotating_light: *Pod Crash Detected*\n"+
 				"*Pod:* %s/%s (container: %s)\n"+
@@ -108,11 +116,33 @@ func (ws *WebhookSender) Send(ctx context.Context, report *v1alpha1.PodCrashRepo
 			payload.NodeName,
 			payload.Reason, payload.ExitCode,
 			report.Status.Diagnostics.OOMContext,
-			report.Status.Diagnostics.TriggerComm, report.Status.Diagnostics.TriggerPID,
-			report.Status.Diagnostics.OOMVictimComm, report.Status.Diagnostics.OOMVictimPID,
+			// Process names come from the kernel's comm, which any workload sets
+			// to anything it likes via prctl(PR_SET_NAME). Every other field here
+			// is a Kubernetes name and cannot contain the characters Slack's
+			// mrkdwn treats as markup; comm can, and "<!channel>" fits inside the
+			// 15 usable bytes, so an unescaped one would let a tenant page a whole
+			// channel on every OOM.
+			escapeSlackText(report.Status.Diagnostics.TriggerComm), report.Status.Diagnostics.TriggerPID,
+			escapeSlackText(report.Status.Diagnostics.OOMVictimComm), report.Status.Diagnostics.OOMVictimPID,
 			payload.VictimRSSMB, payload.OOMScopeLimitMB,
 			payload.Timestamp,
 		)
+		// The JSON payload carries lastLogLines when enabled, so the Slack
+		// message has to as well — otherwise --webhook-include-logs is a silent
+		// no-op for the one endpoint type most people point this at.
+		//
+		// Escaped before it is measured: escaping expands (& becomes &amp;), so
+		// trimming first and escaping afterwards would let a log tail full of
+		// ampersands grow back past the limit and have Slack reject the whole
+		// message. The budget is what is left of the limit after the fields
+		// above, and the fence itself.
+		if len(payload.LastLogLines) > 0 {
+			const fence = "\n*Last log lines:*\n```\n" + "\n```"
+			budget := slackMaxTextBytes - len(text) - len(fence)
+			if block := slackLogBlock(escapeSlackText(strings.Join(payload.LastLogLines, "\n")), budget); block != "" {
+				text += "\n*Last log lines:*\n```\n" + block + "\n```"
+			}
+		}
 		body, err = json.Marshal(SlackPayload{Text: text})
 	} else {
 		body, err = json.Marshal(payload)
@@ -124,7 +154,12 @@ func (ws *WebhookSender) Send(ctx context.Context, report *v1alpha1.PodCrashRepo
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, ws.url, bytes.NewReader(body))
 	if err != nil {
-		logger.Error(err, "Failed to create webhook request")
+		// A URL that will not parse — a Secret created from a file keeps its
+		// trailing newline, which is the usual cause — fails here on every
+		// single report, so an unscrubbed error would repeat the credential in
+		// the log indefinitely.
+		err = ws.scrubURLError(err)
+		logger.Error(err, "Failed to create webhook request", "url", ws.redactedURL())
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -134,6 +169,7 @@ func (ws *WebhookSender) Send(ctx context.Context, report *v1alpha1.PodCrashRepo
 
 	resp, err := ws.client.Do(req)
 	if err != nil {
+		err = ws.scrubURLError(err)
 		logger.Error(err, "Failed to send webhook", "url", ws.redactedURL())
 		return err
 	}
@@ -148,6 +184,85 @@ func (ws *WebhookSender) Send(ctx context.Context, report *v1alpha1.PodCrashRepo
 
 	logger.V(1).Info("Webhook sent successfully", "url", ws.redactedURL(), "report", report.Name)
 	return nil
+}
+
+// slackMaxTextBytes keeps a message inside Slack's 40,000-character limit for
+// the text field, with room for the surrounding template.
+const slackMaxTextBytes = 30000
+
+// slackTruncationMarker introduces a log block whose start was cut off.
+const slackTruncationMarker = "…[earlier lines truncated]\n"
+
+// escapeSlackText escapes the three characters Slack's mrkdwn parser treats as
+// markup, per Slack's own formatting guidance.
+func escapeSlackText(s string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
+}
+
+// slackLogBlock bounds an already-escaped log body to budget bytes, keeping the
+// end — the lines closest to the kill are the interesting ones. Slack rejects an
+// over-long message outright, which would turn a captured log tail into no
+// notification at all.
+//
+// The input must already be escaped: escaping expands, so measuring before it
+// would not bound the result. Cuts land on a rune boundary, and then on the next
+// line break where one is close by, so the block never opens mid-character or
+// mid-line.
+func slackLogBlock(escaped string, budget int) string {
+	if budget <= len(slackTruncationMarker) {
+		return ""
+	}
+	if len(escaped) <= budget {
+		return escaped
+	}
+
+	keep := budget - len(slackTruncationMarker)
+	cut := len(escaped) - keep
+	// Escaping never produces a partial rune, but the cut offset can still land
+	// inside one, so walk forward to the next boundary.
+	for cut < len(escaped) && !utf8.RuneStart(escaped[cut]) {
+		cut++
+	}
+	trimmed := escaped[cut:]
+	if i := strings.IndexByte(trimmed, '\n'); i >= 0 && i < len(trimmed)-1 {
+		trimmed = trimmed[i+1:]
+	}
+	return slackTruncationMarker + trimmed
+}
+
+// IncludesLogs reports whether this sender forwards captured log lines, so the
+// caller knows whether it must supply a report that still has them.
+func (ws *WebhookSender) IncludesLogs() bool {
+	return ws != nil && ws.includeLogs
+}
+
+// scrubURLError strips the webhook URL out of an error before it is logged or
+// returned. net/http and net/url both fail with a *url.Error, whose Error()
+// embeds the full request URL — including the path that Slack and PagerDuty
+// endpoints carry their credential in. Logging that error, or handing it to the
+// reconciler (which logs it again, as does controller-runtime), would defeat
+// redactedURL entirely and write the credential to stdout on every failure.
+//
+// url.Error.Err is the underlying cause and carries no URL, so it can be
+// re-wrapped. Any other error shape is scrubbed by substitution instead, so a
+// transport that formats its own message cannot reintroduce the leak; that path
+// necessarily drops the error chain, which is the right trade when the
+// alternative is publishing the credential.
+func (ws *WebhookSender) scrubURLError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return fmt.Errorf("%s %s: %w", uerr.Op, ws.redactedURL(), uerr.Err)
+	}
+
+	if ws.url != "" && strings.Contains(err.Error(), ws.url) {
+		return errors.New(strings.ReplaceAll(err.Error(), ws.url, ws.redactedURL()))
+	}
+
+	return err
 }
 
 // redactedURL returns the webhook endpoint with its path and query removed.

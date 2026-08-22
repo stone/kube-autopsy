@@ -56,6 +56,7 @@ metadata:
     autopsy.tty.se/reason: OOMKilled
 spec:
   podName: oom-victim
+  namespace: default
   containerName: hogger
   nodeName: node-1
   terminationReason: OOMKilled
@@ -77,6 +78,8 @@ status:
     rssDissection:
       anonRssBytes: 62812160
       fileRssBytes: 1019904
+      shmemRssBytes: 0
+      swapBytes: 0
       pageTablesBytes: 176128
     lastLogLines:
       - "Allocated block 41 (~1MB each)"

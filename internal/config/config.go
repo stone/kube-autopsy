@@ -6,10 +6,21 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
+
+	autopsy "github.com/kube-autopsy/kube-autopsy/api/v1alpha1"
 )
+
+// maxTTLHours bounds --ttl-hours. TTLDuration multiplies by time.Hour, which
+// overflows int64 past roughly 2.5 million hours and wraps to a negative
+// duration — under which the garbage collector considers every report expired
+// and deletes the lot on its first pass, which runs immediately at startup.
+// Ten years is far beyond any real retention policy and nowhere near the wrap.
+const maxTTLHours = 24 * 365 * 10
 
 // Config holds all configuration for the kube-autopsy binary.
 type Config struct {
@@ -57,6 +68,28 @@ type Config struct {
 	WebhookIncludeLogs bool
 	// LeaderElect enables leader election for the controller.
 	LeaderElect bool
+	// MaxConcurrentReconciles bounds how many reports the controller processes
+	// at once. Webhook delivery happens inline and can block for the client's
+	// full timeout, so with a single worker one unresponsive endpoint stalls
+	// every other report behind it.
+	MaxConcurrentReconciles int
+	// MaxReports caps how many PodCrashReports are kept cluster-wide, oldest
+	// deleted first. Retention was time-based only, which bounds how long a
+	// report lives but not how many exist at once — so a cluster-wide crash loop
+	// could grow the collection until the controller could no longer hold it.
+	// Zero disables the cap.
+	MaxReports int
+	// WebhookURLWasFlag records that the URL came from the command line rather
+	// than the environment, so the caller can warn about it. It is resolved
+	// during ResolveSecrets, since that is where precedence is decided.
+	WebhookURLWasFlag bool
+
+	// webhookURLFromEnv holds KUBE_AUTOPSY_WEBHOOK_URL until flags have been
+	// parsed. It is deliberately kept out of WebhookURL until then: BindFlags
+	// registers the current value as each flag's default, and flag.PrintDefaults
+	// prints every default. Since flag.CommandLine is ExitOnError, one mistyped
+	// flag dumps the usage — and with it a credential — into the container log.
+	webhookURLFromEnv string
 }
 
 // NewConfig returns a Config with sensible defaults.
@@ -74,6 +107,9 @@ func NewConfig() *Config {
 		WebhookURL:            "",
 		WebhookIncludeLogs:    false,
 		LeaderElect:           true,
+
+		MaxConcurrentReconciles: 4,
+		MaxReports:              10000,
 	}
 }
 
@@ -101,7 +137,11 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 		"Serve metrics over TLS and require the scraper to be authenticated and authorized")
 	fs.StringVar(&c.HealthProbeBindAddr, "health-probe-bind-addr", c.HealthProbeBindAddr,
 		"Address for health/readiness probes")
-	fs.StringVar(&c.WebhookURL, "webhook-url", c.WebhookURL,
+	// Bound with an empty default rather than the current value: anything passed
+	// to StringVar as a default is printed verbatim by flag.PrintDefaults, so
+	// seeding it from the environment would publish the Secret. ResolveSecrets
+	// puts the environment value back once parsing has decided precedence.
+	fs.StringVar(&c.WebhookURL, "webhook-url", "",
 		"Optional webhook URL for crash notifications (Slack, PagerDuty). "+
 			"DEPRECATED: prefer KUBE_AUTOPSY_WEBHOOK_URL from a Secret, since a "+
 			"flag value is readable by anyone who can get the pod spec")
@@ -109,6 +149,24 @@ func (c *Config) BindFlags(fs *flag.FlagSet) {
 		"Include captured log lines in the webhook payload, sending them outside the cluster")
 	fs.BoolVar(&c.LeaderElect, "leader-elect", c.LeaderElect,
 		"Enable leader election for the controller")
+	fs.IntVar(&c.MaxConcurrentReconciles, "max-concurrent-reconciles", c.MaxConcurrentReconciles,
+		"Reports the controller processes at once. Webhook delivery blocks the "+
+			"worker that runs it, so a single worker lets one slow endpoint stall "+
+			"every other report")
+	fs.IntVar(&c.MaxReports, "max-reports", c.MaxReports,
+		"Cap on how many PodCrashReports are kept cluster-wide, oldest deleted "+
+			"first, so a cluster-wide crash loop cannot grow the collection past "+
+			"what the controller can hold. 0 disables the cap")
+}
+
+// ResolveSecrets applies environment-sourced credentials that were deliberately
+// withheld from the flag defaults, preserving flag > environment > default. It
+// must be called after fs.Parse and before Validate.
+func (c *Config) ResolveSecrets(fs *flag.FlagSet) {
+	c.WebhookURLWasFlag = c.WebhookURLFromFlag(fs)
+	if !c.WebhookURLWasFlag {
+		c.WebhookURL = c.webhookURLFromEnv
+	}
 }
 
 // WebhookURLFromFlag reports whether the webhook URL came from the command line
@@ -125,66 +183,77 @@ func (c *Config) WebhookURLFromFlag(fs *flag.FlagSet) bool {
 
 // LoadFromEnv overrides config values from environment variables.
 // Env vars follow the pattern KUBE_AUTOPSY_<FLAG_NAME> with dashes replaced by underscores.
-func (c *Config) LoadFromEnv() {
-	if v := os.Getenv("KUBE_AUTOPSY_TTL_HOURS"); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
-			c.TTLHours = i
+//
+// A value that does not parse is an error rather than a silent fallback to the
+// default. Discarding it quietly turns a typo in a ConfigMap into a security
+// posture nobody chose — KUBE_AUTOPSY_CAPTURE_LOGS=yes leaves capture off,
+// KUBE_AUTOPSY_METRICS_SECURE=no leaves metrics authenticated — and the operator
+// has no way to tell the setting did not take.
+func (c *Config) LoadFromEnv() error {
+	var errs []error
+
+	envInt := func(key string, target *int) {
+		v := os.Getenv(key)
+		if v == "" {
+			return
+		}
+		i, err := strconv.Atoi(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %q is not an integer", key, v))
+			return
+		}
+		*target = i
+	}
+
+	envBool := func(key string, target *bool) {
+		v := os.Getenv(key)
+		if v == "" {
+			return
+		}
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf(
+				"%s: %q is not a boolean (use true or false)", key, v))
+			return
+		}
+		*target = b
+	}
+
+	envString := func(key string, target *string) {
+		if v := os.Getenv(key); v != "" {
+			*target = v
 		}
 	}
-	if v := os.Getenv("KUBE_AUTOPSY_LOG_TAIL_LINES"); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
-			c.LogTailLines = i
-		}
-	}
-	if v := os.Getenv("KUBE_AUTOPSY_POD_OWNER_REFERENCE"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.PodOwnerReference = b
-		}
-	}
-	if v := os.Getenv("KUBE_AUTOPSY_MAX_CONCURRENT_REPORTS"); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
-			c.MaxConcurrentReports = i
-		}
-	}
-	if v := os.Getenv("KUBE_AUTOPSY_REPORT_COOLDOWN_SECONDS"); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
-			c.ReportCooldownSeconds = i
-		}
-	}
-	if v := os.Getenv("KUBE_AUTOPSY_CAPTURE_LOGS"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.CaptureLogs = b
-		}
-	}
-	if v := os.Getenv("KUBE_AUTOPSY_METRICS_BIND_ADDR"); v != "" {
-		c.MetricsBindAddr = v
-	}
-	if v := os.Getenv("KUBE_AUTOPSY_METRICS_SECURE"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.MetricsSecure = b
-		}
-	}
-	if v := os.Getenv("KUBE_AUTOPSY_HEALTH_PROBE_BIND_ADDR"); v != "" {
-		c.HealthProbeBindAddr = v
-	}
+
+	envInt("KUBE_AUTOPSY_TTL_HOURS", &c.TTLHours)
+	envInt("KUBE_AUTOPSY_LOG_TAIL_LINES", &c.LogTailLines)
+	envInt("KUBE_AUTOPSY_MAX_CONCURRENT_REPORTS", &c.MaxConcurrentReports)
+	envInt("KUBE_AUTOPSY_MAX_CONCURRENT_RECONCILES", &c.MaxConcurrentReconciles)
+	envInt("KUBE_AUTOPSY_REPORT_COOLDOWN_SECONDS", &c.ReportCooldownSeconds)
+
+	envBool("KUBE_AUTOPSY_POD_OWNER_REFERENCE", &c.PodOwnerReference)
+	envBool("KUBE_AUTOPSY_CAPTURE_LOGS", &c.CaptureLogs)
+	envBool("KUBE_AUTOPSY_METRICS_SECURE", &c.MetricsSecure)
+	envBool("KUBE_AUTOPSY_WEBHOOK_INCLUDE_LOGS", &c.WebhookIncludeLogs)
+	envBool("KUBE_AUTOPSY_LEADER_ELECT", &c.LeaderElect)
+
+	envString("KUBE_AUTOPSY_METRICS_BIND_ADDR", &c.MetricsBindAddr)
+	envString("KUBE_AUTOPSY_HEALTH_PROBE_BIND_ADDR", &c.HealthProbeBindAddr)
+
+	// Held aside rather than assigned to WebhookURL, so it never becomes a flag
+	// default; ResolveSecrets applies it after parsing. Surrounding whitespace is
+	// trimmed because the common `--from-file` and `$(cat …)` recipes for the
+	// Secret leave a trailing newline, which makes the URL unparseable.
 	if v := os.Getenv("KUBE_AUTOPSY_WEBHOOK_URL"); v != "" {
-		c.WebhookURL = v
+		c.webhookURLFromEnv = strings.TrimSpace(v)
 	}
 	// Deliberately environment-only: a credential must not be settable from a
 	// flag, where it would be readable in the pod spec and in process listings.
 	if v := os.Getenv("KUBE_AUTOPSY_WEBHOOK_AUTH_HEADER"); v != "" {
-		c.WebhookAuthHeader = v
+		c.WebhookAuthHeader = strings.TrimSpace(v)
 	}
-	if v := os.Getenv("KUBE_AUTOPSY_WEBHOOK_INCLUDE_LOGS"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.WebhookIncludeLogs = b
-		}
-	}
-	if v := os.Getenv("KUBE_AUTOPSY_LEADER_ELECT"); v != "" {
-		if b, err := strconv.ParseBool(v); err == nil {
-			c.LeaderElect = b
-		}
-	}
+
+	return errors.Join(errs...)
 }
 
 // Validate reports whether the configuration is usable. It is called after
@@ -198,17 +267,64 @@ func (c *Config) Validate() error {
 	if c.TTLHours < 1 {
 		errs = append(errs, fmt.Errorf("ttl-hours must be at least 1, got %d", c.TTLHours))
 	}
+	if c.TTLHours > maxTTLHours {
+		errs = append(errs, fmt.Errorf(
+			"ttl-hours must be at most %d (about ten years), got %d: a larger value "+
+				"overflows the retention duration and makes the collector delete every report",
+			maxTTLHours, c.TTLHours))
+	}
 	if c.LogTailLines < 1 {
 		errs = append(errs, fmt.Errorf("log-tail-lines must be at least 1, got %d", c.LogTailLines))
+	}
+	if c.LogTailLines > autopsy.MaxLogLines {
+		errs = append(errs, fmt.Errorf(
+			"log-tail-lines must be at most %d, got %d: the PodCrashReport schema "+
+				"rejects a longer list, which would fail the status write and lose "+
+				"every other diagnostic along with the logs",
+			autopsy.MaxLogLines, c.LogTailLines))
 	}
 	if c.MaxConcurrentReports < 1 {
 		errs = append(errs, fmt.Errorf("max-concurrent-reports must be at least 1, got %d", c.MaxConcurrentReports))
 	}
+	if c.MaxConcurrentReconciles < 1 {
+		errs = append(errs, fmt.Errorf("max-concurrent-reconciles must be at least 1, got %d", c.MaxConcurrentReconciles))
+	}
+	if c.MaxReports < 0 {
+		errs = append(errs, fmt.Errorf("max-reports cannot be negative, got %d", c.MaxReports))
+	}
 	if c.ReportCooldownSeconds < 0 {
 		errs = append(errs, fmt.Errorf("report-cooldown-seconds cannot be negative, got %d", c.ReportCooldownSeconds))
 	}
+	// Checked at startup rather than at the first crash: an unusable URL
+	// otherwise fails once per report, forever, and each failure is a chance to
+	// spill the credential into a log.
+	if c.WebhookURL != "" {
+		if err := validateWebhookURL(c.WebhookURL); err != nil {
+			// The URL is a credential, so the offending value is never quoted back.
+			errs = append(errs, fmt.Errorf("webhook URL is not usable: %w", err))
+		}
+	}
 
 	return errors.Join(errs...)
+}
+
+// validateWebhookURL rejects a URL the HTTP client could not use, without
+// including the URL itself in the error.
+func validateWebhookURL(raw string) error {
+	if raw != strings.TrimSpace(raw) {
+		return errors.New("it has leading or trailing whitespace")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("it is not a valid URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("its scheme is %q, want http or https", u.Scheme)
+	}
+	if u.Host == "" {
+		return errors.New("it has no host")
+	}
+	return nil
 }
 
 // TTLDuration returns the TTL as a time.Duration.

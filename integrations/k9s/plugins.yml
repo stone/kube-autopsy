@@ -24,16 +24,27 @@ plugins:
     args:
       - -c
       - |
+        # jq's "//" binds looser than "/", so `x // 0 / 1024 / 1024` parses as
+        # `x // (0/1024/1024)` and the division never happens — which printed raw
+        # bytes under an MB label. The parentheses are load-bearing.
+        #
+        # rssDissection is absent when the kernel's memory layout was not
+        # recognised, so every field below has an explicit fallback rather than
+        # rendering the string "null".
         kubectl get pcr $NAME -n $NAMESPACE -o json | jq -r '
-        "OOM Context: \(.status.diagnostics.oomContext)",
-        "Trigger Process: \(.status.diagnostics.triggerComm) (PID: \(.status.diagnostics.triggerPid))",
-        "Victim Process: \(.status.diagnostics.oomVictimComm) (PID: \(.status.diagnostics.oomVictimPid))",
-        "Victim RSS (MB): \(.status.diagnostics.victimRssBytes // 0 / 1024 / 1024 | floor)",
-        "OOM Scope Limit (MB): \(.status.diagnostics.oomScopeLimitBytes // 0 / 1024 / 1024 | floor)",
+        def mb: if . == null then "n/a" else (. / 1048576 | floor | tostring) end;
+        def bytes: if . == null then "n/a" else tostring end;
+        "OOM Context: \(.status.diagnostics.oomContext // "n/a")",
+        "Trigger Process: \(.status.diagnostics.triggerComm // "n/a") (PID: \(.status.diagnostics.triggerPid // 0))",
+        "Victim Process: \(.status.diagnostics.oomVictimComm // "n/a") (PID: \(.status.diagnostics.oomVictimPid // 0))",
+        "Victim RSS (MB): \(.status.diagnostics.victimRssBytes | mb)",
+        "OOM Scope Limit (MB): \(.status.diagnostics.oomScopeLimitBytes | mb)",
         "---",
-        "Anon RSS (Bytes): \(.status.diagnostics.rssDissection.anonRssBytes)",
-        "File RSS (Bytes): \(.status.diagnostics.rssDissection.fileRssBytes)",
-        "Page Tables (Bytes): \(.status.diagnostics.rssDissection.pageTablesBytes)"
+        "Anon RSS (Bytes): \(.status.diagnostics.rssDissection.anonRssBytes | bytes)",
+        "File RSS (Bytes): \(.status.diagnostics.rssDissection.fileRssBytes | bytes)",
+        "Shmem RSS (Bytes): \(.status.diagnostics.rssDissection.shmemRssBytes | bytes)",
+        "Swap (Bytes): \(.status.diagnostics.rssDissection.swapBytes | bytes)",
+        "Page Tables (Bytes): \(.status.diagnostics.rssDissection.pageTablesBytes | bytes)"
         ' | less
 
   # Plugin 3: Jump from a standard Pod to its Crash Report

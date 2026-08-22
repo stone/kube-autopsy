@@ -63,6 +63,11 @@ jobs:
         with:
           context: .
           push: true
+          # Stamped into the binary so `kube-autopsy version` and the startup log
+          # identify exactly what is running.
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
           # The agent ships an architecture-specific eBPF object, so each
           # platform must be built rather than assumed portable.
           platforms: linux/amd64,linux/arm64

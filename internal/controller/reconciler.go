@@ -11,6 +11,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/kube-autopsy/kube-autopsy/api/v1alpha1"
@@ -44,6 +45,36 @@ type PodCrashReportReconciler struct {
 	Config        *config.Config
 	WebhookSender *WebhookSender
 	Recorder      events.EventRecorder
+	// APIReader reads straight from the API server, bypassing the cache. The
+	// cache drops captured log lines to bound the controller's memory (see
+	// StripCachedLogLines), so a webhook configured to forward them has to fetch
+	// the report again through this.
+	APIReader client.Reader
+	// startedAt anchors the webhook retry window for reports that already
+	// existed when this process started; see webhookDeadline.
+	startedAt time.Time
+}
+
+// StripCachedLogLines removes captured log lines as reports enter the informer
+// cache. The controller watches every report in the cluster and, with capture
+// on, each one can carry 64KiB of logs — which makes the controller's memory a
+// function of how badly the cluster is crashing, so it is most likely to be
+// OOM-killed during the incident it exists to explain. Nothing in the reconcile
+// path reads them; the webhook sender re-reads the report through APIReader on
+// the rare occasion it needs them.
+func StripCachedLogLines(obj any) (any, error) {
+	report, ok := obj.(*v1alpha1.PodCrashReport)
+	if !ok {
+		return obj, nil
+	}
+	if report.Status.Diagnostics.LastLogLines == nil {
+		return obj, nil
+	}
+	// The informer owns this object and hands the same pointer to every reader,
+	// so it must be copied rather than mutated in place.
+	stripped := report.DeepCopy()
+	stripped.Status.Diagnostics.LastLogLines = nil
+	return stripped, nil
 }
 
 // Reconcile handles a single PodCrashReport reconciliation cycle. Reports that
@@ -103,18 +134,26 @@ func (r *PodCrashReportReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// silently dropped alert.
 	notifiedAt := report.Status.NotifiedAt
 	if r.WebhookSender != nil && notifiedAt == nil {
-		if err := r.WebhookSender.Send(ctx, &report); err != nil {
-			// Give up once the report is old enough that retrying is pointless,
-			// so a permanently broken endpoint cannot pin every report in
-			// Pending forever.
-			if age := time.Since(report.CreationTimestamp.Time); age < webhookRetryWindow {
+		if err := r.sendWebhook(ctx, &report); err != nil {
+			// Give up once retrying is pointless, so a permanently broken
+			// endpoint cannot pin every report in Pending forever.
+			if deadline := r.webhookDeadline(&report); time.Now().Before(deadline) {
 				logger.Error(err, "webhook delivery failed, will retry",
-					"name", report.Name, "age", age.String())
+					"name", report.Name, "givingUpAt", deadline.UTC().Format(time.RFC3339))
+				WebhookDeliveriesTotal.WithLabelValues("retry").Inc()
 				return ctrl.Result{}, err
 			}
 			logger.Error(err, "webhook delivery failed and the retry window has expired, giving up",
 				"name", report.Name, "retryWindow", webhookRetryWindow.String())
+			// The alert is now lost. It is counted and surfaced as an Event
+			// because a log line is not something anyone alerts on, and a webhook
+			// endpoint that has been quietly failing is otherwise invisible.
+			WebhookDeliveriesTotal.WithLabelValues("dropped").Inc()
+			r.Recorder.Eventf(&report, nil, "Warning", "NotificationDropped", "SendWebhook",
+				"Giving up on webhook delivery for pod %s/%s after %s; this crash was not notified",
+				report.Spec.Namespace, report.Spec.PodName, webhookRetryWindow)
 		} else {
+			WebhookDeliveriesTotal.WithLabelValues("success").Inc()
 			now := metav1.Now()
 			notifiedAt = &now
 		}
@@ -174,10 +213,59 @@ func (r *PodCrashReportReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	return ctrl.Result{}, nil
 }
 
+// webhookDeadline returns the instant after which delivery for this report is
+// abandoned.
+//
+// The window runs from the later of the report's creation and this process's
+// start. Anchoring it to creation alone meant a controller that had been down
+// for longer than the window — a node drain, a rollout, a slow image pull — came
+// back to find every queued report already expired, so each got a single
+// delivery attempt and any transient failure (a Slack 429 against a backlog is
+// the obvious one) discarded the whole backlog at once.
+func (r *PodCrashReportReconciler) webhookDeadline(report *v1alpha1.PodCrashReport) time.Time {
+	from := report.CreationTimestamp.Time
+	if r.startedAt.After(from) {
+		from = r.startedAt
+	}
+	return from.Add(webhookRetryWindow)
+}
+
+// sendWebhook delivers one report, re-reading it uncached first when the
+// payload is configured to carry log lines, since the cache does not hold them.
+func (r *PodCrashReportReconciler) sendWebhook(ctx context.Context, report *v1alpha1.PodCrashReport) error {
+	if r.WebhookSender.IncludesLogs() && r.APIReader != nil {
+		var full v1alpha1.PodCrashReport
+		key := client.ObjectKeyFromObject(report)
+		if err := r.APIReader.Get(ctx, key, &full); err != nil {
+			// Not fatal: notifying without the log tail beats not notifying.
+			log.FromContext(ctx).Error(err, "could not re-read report for webhook log lines, sending without them",
+				"name", report.Name)
+		} else {
+			report = &full
+		}
+	}
+	return r.WebhookSender.Send(ctx, report)
+}
+
 // SetupWithManager registers the PodCrashReportReconciler with the given
 // controller manager, watching for PodCrashReport resources.
 func (r *PodCrashReportReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	r.startedAt = time.Now()
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+
+	workers := 1
+	if r.Config != nil && r.Config.MaxConcurrentReconciles > 0 {
+		workers = r.Config.MaxConcurrentReconciles
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha1.PodCrashReport{}).
+		// Webhook delivery runs inline and blocks for the client's full timeout,
+		// so a single worker lets one unresponsive endpoint stall every other
+		// report behind it — long enough that the later ones age past their
+		// retry window and are dropped without ever being attempted.
+		WithOptions(controller.Options{MaxConcurrentReconciles: workers}).
 		Complete(r)
 }

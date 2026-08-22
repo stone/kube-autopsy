@@ -96,7 +96,7 @@ func TestFindContainerByID(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := findContainerByID(pod, tt.containerID)
+			result, _ := findContainerByID(pod, tt.containerID)
 			if result != tt.expectedName {
 				t.Errorf("findContainerByID(%q) = %q, want %q", tt.containerID, result, tt.expectedName)
 			}

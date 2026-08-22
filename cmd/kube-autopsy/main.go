@@ -25,6 +25,7 @@ import (
 	"github.com/kube-autopsy/kube-autopsy/internal/agent"
 	"github.com/kube-autopsy/kube-autopsy/internal/config"
 	"github.com/kube-autopsy/kube-autopsy/internal/controller"
+	"github.com/kube-autopsy/kube-autopsy/internal/version"
 )
 
 var (
@@ -37,9 +38,19 @@ func init() {
 	utilruntime.Must(autopsyv1alpha1.AddToScheme(scheme))
 }
 
+const usage = `kube-autopsy captures why a container was OOMKilled.
+
+Usage:
+  kube-autopsy agent [flags]        Run the per-node eBPF agent (DaemonSet)
+  kube-autopsy controller [flags]   Run the report controller (Deployment)
+  kube-autopsy version              Print the build version
+
+Run a subcommand with --help to list its flags.
+`
+
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: kube-autopsy <agent|controller> [flags]\n")
+		fmt.Fprint(os.Stderr, usage)
 		os.Exit(1)
 	}
 
@@ -52,10 +63,47 @@ func main() {
 		runAgent()
 	case "controller":
 		runController()
+	case "version", "--version", "-version":
+		fmt.Println(version.String())
+	case "help", "--help", "-h":
+		fmt.Print(usage)
 	default:
-		fmt.Fprintf(os.Stderr, "Unknown subcommand %q. Usage: kube-autopsy <agent|controller> [flags]\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown subcommand %q.\n\n%s", subcommand, usage)
 		os.Exit(1)
 	}
+}
+
+// loadConfig merges defaults, environment and flags, and installs the logger.
+//
+// Precedence is flag > environment > default. Environment variables are applied
+// first so BindFlags registers them as the flag defaults, letting an explicitly
+// passed flag win — except for the webhook URL, which is a credential and would
+// be printed by flag.PrintDefaults; ResolveSecrets applies that one after
+// parsing instead.
+func loadConfig() (*config.Config, error) {
+	cfg := config.NewConfig()
+	envErr := cfg.LoadFromEnv()
+
+	fs := flag.CommandLine
+	cfg.BindFlags(fs)
+
+	opts := zap.Options{Development: false}
+	opts.BindFlags(fs)
+	flag.Parse()
+
+	// Installed before any error is reported, so configuration problems come out
+	// through the same structured logger as everything else.
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	cfg.ResolveSecrets(fs)
+
+	if envErr != nil {
+		return nil, envErr
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
 // metricsOptions builds the metrics server configuration shared by both
@@ -73,22 +121,8 @@ func metricsOptions(cfg *config.Config) metricsserver.Options {
 }
 
 func runAgent() {
-	// Precedence is flag > env > default: environment variables are applied
-	// first so that BindFlags registers them as the flag defaults, letting an
-	// explicitly passed flag win.
-	cfg := config.NewConfig()
-	cfg.LoadFromEnv()
-
-	fs := flag.CommandLine
-	cfg.BindFlags(fs)
-
-	opts := zap.Options{Development: false}
-	opts.BindFlags(fs)
-	flag.Parse()
-
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
-
-	if err := cfg.Validate(); err != nil {
+	cfg, err := loadConfig()
+	if err != nil {
 		setupLog.Error(err, "invalid configuration")
 		os.Exit(1)
 	}
@@ -99,7 +133,8 @@ func runAgent() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting kube-autopsy agent", "node", nodeName)
+	setupLog.Info("starting kube-autopsy agent",
+		"node", nodeName, "version", version.Version, "commit", version.Commit)
 
 	// Create a minimal manager for the Kubernetes client. The pod informer is
 	// restricted to this node: without this the agent on every node would watch
@@ -110,8 +145,9 @@ func runAgent() {
 	agent.RegisterMetrics()
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:  scheme,
-		Metrics: metricsOptions(cfg),
+		Scheme:                 scheme,
+		Metrics:                metricsOptions(cfg),
+		HealthProbeBindAddress: cfg.HealthProbeBindAddr,
 		Cache: cache.Options{
 			ByObject: map[client.Object]cache.ByObject{
 				&corev1.Pod{}: {
@@ -140,6 +176,19 @@ func runAgent() {
 
 	a := agent.NewAgent(mgr.GetClient(), cfg, nodeName)
 
+	// Liveness is process health; readiness is "the kprobe is attached and the
+	// ring buffer is being read". Without the second one a node whose agent
+	// loaded but never attached looks identical to a healthy one, and the
+	// operator reads an empty report list as "nothing crashed".
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		setupLog.Error(err, "unable to set up health check")
+		os.Exit(1)
+	}
+	if err := mgr.AddReadyzCheck("tracing", a.TracingReadyCheck); err != nil {
+		setupLog.Error(err, "unable to set up readiness check")
+		os.Exit(1)
+	}
+
 	// Start the manager in a goroutine so the cache is available for the agent.
 	go func() {
 		if err := mgr.Start(ctx); err != nil {
@@ -163,25 +212,14 @@ func runAgent() {
 }
 
 func runController() {
-	// Precedence is flag > env > default; see runAgent.
-	cfg := config.NewConfig()
-	cfg.LoadFromEnv()
-
-	fs := flag.CommandLine
-	cfg.BindFlags(fs)
-
-	opts := zap.Options{Development: false}
-	opts.BindFlags(fs)
-	flag.Parse()
-
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
-
-	if err := cfg.Validate(); err != nil {
+	cfg, err := loadConfig()
+	if err != nil {
 		setupLog.Error(err, "invalid configuration")
 		os.Exit(1)
 	}
 
-	setupLog.Info("starting kube-autopsy controller")
+	setupLog.Info("starting kube-autopsy controller",
+		"version", version.Version, "commit", version.Commit)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
@@ -189,6 +227,19 @@ func runController() {
 		LeaderElectionID:       "kube-autopsy-leader",
 		Metrics:                metricsOptions(cfg),
 		HealthProbeBindAddress: cfg.HealthProbeBindAddr,
+		Cache: cache.Options{
+			ByObject: map[client.Object]cache.ByObject{
+				// The controller watches every report in the cluster, and with log
+				// capture on each one carries up to 64KiB of log lines. Cached in
+				// full they make the controller's memory a function of how badly
+				// the cluster is crashing, so it is most likely to be OOM-killed
+				// during the incident it exists to explain. Nothing in the
+				// controller reads the log lines except the webhook sender, which
+				// re-reads the report from the API server, so they are dropped on
+				// the way into the cache.
+				&autopsyv1alpha1.PodCrashReport{}: {Transform: controller.StripCachedLogLines},
+			},
+		},
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to create manager")
@@ -201,7 +252,7 @@ func runController() {
 	// Set up the webhook sender if configured.
 	var webhookSender *controller.WebhookSender
 	if cfg.WebhookURL != "" {
-		if cfg.WebhookURLFromFlag(fs) {
+		if cfg.WebhookURLWasFlag {
 			setupLog.Info("WARNING: --webhook-url is deprecated because a flag value is " +
 				"visible in the pod spec to anyone who can read pods. Set the " +
 				"KUBE_AUTOPSY_WEBHOOK_URL environment variable from a Secret instead")
@@ -220,6 +271,7 @@ func runController() {
 		Config:        cfg,
 		WebhookSender: webhookSender,
 		Recorder:      mgr.GetEventRecorder("kube-autopsy-controller"),
+		APIReader:     mgr.GetAPIReader(),
 	}
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to set up PodCrashReport reconciler")
@@ -237,7 +289,7 @@ func runController() {
 	}
 
 	// Register the garbage collector as a Runnable with the manager.
-	gc := controller.NewGarbageCollector(mgr.GetClient(), cfg.TTLDuration())
+	gc := controller.NewGarbageCollector(mgr.GetClient(), cfg.TTLDuration(), cfg.MaxReports)
 	if err := mgr.Add(gc); err != nil {
 		setupLog.Error(err, "unable to set up garbage collector")
 		os.Exit(1)

@@ -17,7 +17,14 @@
 #   CLUSTER_NAME=my-test ./test/e2e/run.sh  # Custom cluster name
 #   OVERLAY=hardened ./test/e2e/run.sh      # Test the least-privilege overlay
 #
-set -euo pipefail
+# NOTE: -e is deliberately NOT set. The assertions below report failure through
+# a return code, and every one of them is called as a bare command — so `set -e`
+# made the first failing assertion abort the whole script. The EXIT trap still
+# fired, which deleted the kind cluster, so a failure skipped the remaining
+# assertions, skipped collect_debug_info, never printed the summary, and
+# destroyed the evidence you would debug on. Failures are tracked in
+# TESTS_FAILED and reported by print_summary instead.
+set -uo pipefail
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -119,6 +126,14 @@ cleanup() {
         return
     fi
 
+    # A failed run leaves the cluster up: the whole point of the debug dump is
+    # that someone can go and look, which a deleted cluster makes impossible.
+    if [ "${TESTS_FAILED}" -gt 0 ]; then
+        warn "Tests failed; keeping cluster '${CLUSTER_NAME}' for debugging."
+        warn "Delete manually: kind delete cluster --name ${CLUSTER_NAME}"
+        return
+    fi
+
     header "Cleanup"
     log "Deleting kind cluster '${CLUSTER_NAME}'..."
     kind delete cluster --name "${CLUSTER_NAME}" 2>/dev/null || true
@@ -138,11 +153,14 @@ phase_create_cluster() {
     fi
 
     log "Creating kind cluster '${CLUSTER_NAME}'..."
-    kind create cluster --name "${CLUSTER_NAME}" --config "${KIND_CONFIG}" --wait 60s
+    # Checked explicitly: without `set -e` a failing command does not stop the
+    # function, and the function's status is only its last command's — so an
+    # unchecked failure here would be reported as success by the caller.
+    kind create cluster --name "${CLUSTER_NAME}" --config "${KIND_CONFIG}" --wait 60s || return 1
     ok "Cluster created"
 
     log "Waiting for node to be Ready..."
-    kubectl wait --for=condition=Ready node --all --timeout=60s
+    kubectl wait --for=condition=Ready node --all --timeout=60s || return 1
     ok "Node ready"
 }
 
@@ -153,11 +171,11 @@ phase_build_image() {
     header "Phase 2: Build and load Docker image"
 
     log "Building image '${IMAGE_NAME}'..."
-    docker build -t "${IMAGE_NAME}" "${PROJECT_ROOT}"
+    docker build -t "${IMAGE_NAME}" "${PROJECT_ROOT}" || return 1
     ok "Image built"
 
     log "Loading image into kind cluster..."
-    kind load docker-image "${IMAGE_NAME}" --name "${CLUSTER_NAME}"
+    kind load docker-image "${IMAGE_NAME}" --name "${CLUSTER_NAME}" || return 1
     ok "Image loaded"
 }
 
@@ -172,19 +190,20 @@ phase_deploy() {
     # catches breakage in it. OVERLAY can be set to "hardened" to test the
     # least-privilege posture instead.
     log "Rendering the '${OVERLAY}' overlay with the e2e image..."
+    # pipefail is on, so a failure anywhere in the pipeline is caught here.
     kubectl kustomize "${PROJECT_ROOT}/deploy/overlays/${OVERLAY}" \
         | sed -E "s|ghcr.io/stone/kube-autopsy:latest|${IMAGE_NAME}|g" \
         | sed 's/--leader-elect=true/--leader-elect=false/' \
-        | kubectl apply -f -
+        | kubectl apply -f - || return 1
     ok "Overlay '${OVERLAY}' applied"
 
     log "Waiting for controller to be ready..."
     wait_for_condition "Controller ready" 60 \
-        kubectl -n kube-autopsy rollout status deployment/kube-autopsy-controller --timeout=5s
+        kubectl -n kube-autopsy rollout status deployment/kube-autopsy-controller --timeout=5s || return 1
 
     log "Waiting for DaemonSet agent to be ready..."
-    wait_for_condition "Agent ready" 60 \
-        kubectl -n kube-autopsy rollout status daemonset/kube-autopsy-agent --timeout=5s
+    wait_for_condition "Agent ready" 120 \
+        kubectl -n kube-autopsy rollout status daemonset/kube-autopsy-agent --timeout=5s || return 1
 
     ok "All kube-autopsy components running"
     echo
@@ -473,6 +492,16 @@ print_summary() {
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+# fatal aborts the run for an infrastructure failure — no cluster, no image —
+# as opposed to a test assertion, which is recorded and carries on.
+fatal() {
+    fail "$*"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+    collect_debug_info
+    print_summary
+    exit 1
+}
+
 main() {
     header "kube-autopsy e2e test"
     log "Cluster: ${CLUSTER_NAME}"
@@ -483,9 +512,9 @@ main() {
 
     trap cleanup EXIT
 
-    phase_create_cluster
-    phase_build_image
-    phase_deploy
+    phase_create_cluster || fatal "Could not create the kind cluster"
+    phase_build_image    || fatal "Could not build or load the image"
+    phase_deploy         || fatal "Could not deploy the '${OVERLAY}' overlay"
     phase_run_tests
     phase_verify_reports
 

@@ -3,10 +3,17 @@ IMG ?= kube-autopsy:latest
 BINARY = kube-autopsy
 .DEFAULT_GOAL := build
 
+# Stamped into the binary so a running agent can be traced back to its source;
+# an image tag is not enough, since :latest moves.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+VERSION_PKG = github.com/kube-autopsy/kube-autopsy/internal/version
+LDFLAGS = -X $(VERSION_PKG).Version=$(VERSION) -X $(VERSION_PKG).Commit=$(COMMIT)
+
 ##@ Build
 .PHONY: build
 build: ## Build the binary.
-	go build -o bin/$(BINARY) ./cmd/kube-autopsy/
+	go build -ldflags="$(LDFLAGS)" -o bin/$(BINARY) ./cmd/kube-autopsy/
 
 .PHONY: fmt
 fmt: ## Run go fmt.
@@ -19,6 +26,11 @@ vet: ## Run go vet.
 .PHONY: test
 test: ## Run tests with race detection.
 	go test ./... -v -race
+
+.PHONY: cover
+cover: ## Run tests and report per-package coverage.
+	go test ./... -coverprofile=coverage.out
+	go tool cover -func=coverage.out | tail -1
 
 .PHONY: lint
 lint: ## Run golangci-lint.
@@ -41,7 +53,7 @@ generate-bpf: ## Regenerate the eBPF objects and Go bindings (needs clang and li
 ##@ Docker
 .PHONY: docker-build
 docker-build: ## Build the Docker image.
-	docker build -t $(IMG) .
+	docker build --build-arg VERSION=$(VERSION) --build-arg COMMIT=$(COMMIT) -t $(IMG) .
 
 .PHONY: docker-push
 docker-push: ## Push the Docker image.

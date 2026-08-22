@@ -26,6 +26,8 @@ type BpfOomEvent struct {
 	ScopeTotalPages uint64
 	AnonRssPages    uint64
 	FileRssPages    uint64
+	ShmemRssPages   uint64
+	SwapPages       uint64
 	PgtablesBytes   uint64
 	CgroupName      [128]int8
 	IsGlobalOom     bool

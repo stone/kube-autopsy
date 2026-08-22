@@ -10,16 +10,48 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/kube-autopsy/kube-autopsy/internal/config"
+	"golang.org/x/sys/unix"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
+
+// cgroupRoot is the unified cgroup hierarchy mount point.
+const cgroupRoot = "/sys/fs/cgroup"
+
+// detectCgroupVersion reports the cgroup hierarchy in use, refusing to run on
+// anything but the unified one.
+//
+// This is a hard requirement rather than a preference: the eBPF program reads
+// the victim's cgroup through task->cgroups->dfl_cgrp, which is the unified
+// hierarchy's node. On a v1 host that name is not the container scope, so every
+// kill would be received and then silently fail to resolve to a pod — a failure
+// mode that looks exactly like a quiet node.
+func detectCgroupVersion() (string, error) {
+	var st unix.Statfs_t
+	if err := unix.Statfs(cgroupRoot, &st); err != nil {
+		return "", fmt.Errorf(
+			"cannot inspect %s (%w); kube-autopsy requires a cgroups v2 (unified) host",
+			cgroupRoot, err)
+	}
+	if st.Type != unix.CGROUP2_SUPER_MAGIC {
+		return "", fmt.Errorf(
+			"%s is not a cgroups v2 (unified) hierarchy; kube-autopsy cannot resolve "+
+				"an OOM victim to its pod on cgroups v1, so every kill on this node "+
+				"would go unreported. Boot the node with systemd.unified_cgroup_hierarchy=1 "+
+				"or use a distribution that defaults to cgroups v2",
+			cgroupRoot)
+	}
+	return "v2", nil
+}
 
 var log = logf.Log.WithName("agent")
 
@@ -82,8 +114,9 @@ type CrashEvent struct {
 	// OOMScopeLimitBytes is the capacity of the OOM scope (the container's
 	// memory limit, or the node's RAM for a global OOM), not the victim's usage.
 	OOMScopeLimitBytes int64
-	// VictimRSSBytes is the victim's anonymous plus file-backed resident memory.
-	// Only meaningful when RSSValid is true.
+	// VictimRSSBytes is the victim's resident memory: anonymous plus file-backed
+	// plus shared, matching the kernel's get_mm_rss(). Only meaningful when
+	// RSSValid is true.
 	VictimRSSBytes  int64
 	OOMVictimPID    int32
 	OOMVictimComm   string
@@ -93,6 +126,8 @@ type CrashEvent struct {
 	OOMScoreAdj     int32
 	AnonRSSBytes    int64
 	FileRSSBytes    int64
+	ShmemRSSBytes   int64
+	SwapBytes       int64
 	PageTablesBytes int64
 	// RSSValid reports whether the kernel's memory layout was recognised. When
 	// false the RSS figures are unknown and must not be published.
@@ -109,6 +144,11 @@ type Agent struct {
 	client   client.Client
 	cfg      *config.Config
 	nodeName string
+	// tracing reports whether the kprobe is attached and the ring buffer is
+	// being read. It backs the readiness probe: a process that started but never
+	// attached is otherwise indistinguishable from a working one, and an empty
+	// report list reads as "nothing crashed" rather than "not watching".
+	tracing atomic.Bool
 }
 
 // NewAgent creates a new Agent instance bound to the given Kubernetes client,
@@ -121,14 +161,33 @@ func NewAgent(client client.Client, cfg *config.Config, nodeName string) *Agent 
 	}
 }
 
+// TracingReadyCheck is a healthz.Checker reporting whether this node is
+// actually being traced.
+func (a *Agent) TracingReadyCheck(*http.Request) error {
+	if !a.tracing.Load() {
+		return errors.New("eBPF tracer is not attached")
+	}
+	return nil
+}
+
 // Run starts the agent. It attaches the eBPF tracer and blocks until ctx is
 // cancelled. Reports already in flight when cancellation arrives are given up
 // to shutdownDrainTimeout to reach the API server.
 func (a *Agent) Run(ctx context.Context) error {
+	// Checked rather than assumed. Pod resolution reads the victim's unified
+	// cgroup name, which only exists on cgroups v2, so on a v1 node the agent
+	// would load, attach, receive every kill and silently resolve none of them —
+	// looking perfectly healthy while reporting nothing.
+	cgroupVersion, err := detectCgroupVersion()
+	if err != nil {
+		return err
+	}
+
 	log.Info("agent starting",
 		"nodeName", a.nodeName,
-		"cgroupVersion", "v2",
+		"cgroupVersion", cgroupVersion,
 		"logTailLines", a.cfg.LogTailLines,
+		"captureLogs", a.cfg.CaptureLogs,
 		"uid", os.Getuid(),
 	)
 
@@ -149,6 +208,10 @@ func (a *Agent) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to initialize eBPF tracer: %w", err)
 	}
 	defer tracer.Close()
+
+	// From here the node is genuinely being watched, so the pod can go Ready.
+	a.tracing.Store(true)
+	defer a.tracing.Store(false)
 
 	// Report creation runs on a context detached from ctx: when SIGTERM cancels
 	// ctx we still need the API calls for already-captured events to succeed.
@@ -177,24 +240,33 @@ func (a *Agent) Run(ctx context.Context) error {
 			// the running kernel, not a constant (arm64 commonly uses 64KiB).
 			anonRSS := int64(event.AnonRssPages) * pageSize
 			fileRSS := int64(event.FileRssPages) * pageSize
+			shmemRSS := int64(event.ShmemRssPages) * pageSize
 
 			crash := CrashEvent{
 				ContainerID:        containerIDFromCgroup(parseComm(event.CgroupName[:])),
 				OOMScopeLimitBytes: int64(event.ScopeTotalPages) * pageSize,
-				VictimRSSBytes:     anonRSS + fileRSS,
-				OOMVictimPID:       int32(event.Tpid),
-				OOMVictimComm:      parseComm(event.Tcomm[:]),
-				TriggerPID:         int32(event.Fpid),
-				TriggerComm:        parseComm(event.Fcomm[:]),
-				OOMScore:           event.OomScore,
-				OOMScoreAdj:        int32(event.OomScoreAdj),
-				AnonRSSBytes:       anonRSS,
-				FileRSSBytes:       fileRSS,
-				PageTablesBytes:    int64(event.PgtablesBytes),
-				RSSValid:           event.RssValid,
-				IsGlobalOOM:        event.IsGlobalOom,
-				DetectedAt:         time.Now(),
+				// Matches the kernel's get_mm_rss(), so this reconciles with
+				// the OOMScore reported next to it.
+				VictimRSSBytes:  anonRSS + fileRSS + shmemRSS,
+				OOMVictimPID:    int32(event.Tpid),
+				OOMVictimComm:   parseComm(event.Tcomm[:]),
+				TriggerPID:      int32(event.Fpid),
+				TriggerComm:     parseComm(event.Fcomm[:]),
+				OOMScore:        event.OomScore,
+				OOMScoreAdj:     int32(event.OomScoreAdj),
+				AnonRSSBytes:    anonRSS,
+				FileRSSBytes:    fileRSS,
+				ShmemRSSBytes:   shmemRSS,
+				SwapBytes:       int64(event.SwapPages) * pageSize,
+				PageTablesBytes: int64(event.PgtablesBytes),
+				RSSValid:        event.RssValid,
+				IsGlobalOOM:     event.IsGlobalOom,
+				DetectedAt:      time.Now(),
 			}
+
+			// Counted before any filtering, so "the agent saw nothing" can be
+			// told apart from "the agent saw plenty and recorded none of it".
+			EventsReceivedTotal.Inc()
 
 			// Suppression is keyed on the container, so a crash loop reports
 			// once per window while unrelated containers are unaffected.
@@ -205,16 +277,29 @@ func (a *Agent) Run(ctx context.Context) error {
 				continue
 			}
 
+			// The slot is taken here rather than inside the goroutine. Acquiring
+			// it after the `go` bounded only the concurrent API calls, not the
+			// goroutines queued to make them — so a node-wide OOM storm, which is
+			// the case the limit exists for, could still pile up thousands of them
+			// inside the DaemonSet's memory limit.
+			//
+			// The cancellation arm watches ctx, not reportCtx: reportCtx outlives
+			// the drain by design, so waiting on it would let this goroutine sit
+			// here through the whole shutdown window and then call wg.Add after
+			// wg.Wait had already started on a zero counter — the race the drain
+			// below is careful to avoid. On SIGTERM the reader stops taking new
+			// work immediately; events already handed to a worker still complete
+			// on reportCtx.
+			select {
+			case slots <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
+
 			wg.Add(1)
 			go func(ce CrashEvent) {
 				defer wg.Done()
-
-				select {
-				case slots <- struct{}{}:
-					defer func() { <-slots }()
-				case <-reportCtx.Done():
-					return
-				}
+				defer func() { <-slots }()
 
 				a.handleCrashEvent(reportCtx, ce, reporter, capturer)
 			}(crash)
@@ -283,15 +368,28 @@ func (a *Agent) handleCrashEvent(ctx context.Context, event CrashEvent, reporter
 		CaptureLatencySeconds.Observe(time.Since(event.DetectedAt).Seconds())
 	}()
 
+	if !event.RSSValid {
+		UnsupportedKernelEventsTotal.Inc()
+	}
+
 	// Resolve pod metadata from the Kubernetes API.
 	podMeta, err := reporter.ResolvePodMeta(ctx, event)
 	if err != nil {
+		var listErr *PodListError
+		if errors.As(err, &listErr) {
+			// A failure to read pods at all is an agent problem and has to be
+			// visible; it used to share a counter and a V(1) log line with the
+			// expected no-pod case below, where nobody would ever see it.
+			eventLog.Error(err, "could not list pods to resolve the OOM victim")
+			ReportErrorsTotal.WithLabelValues(StageListPods).Inc()
+			return
+		}
 		// A global OOM can kill a process that belongs to no pod at all (a
 		// systemd unit, sshd, the kubelet). That is not an agent failure, and
 		// logging it as an error would be loudest exactly when the node is
 		// already unhealthy.
 		eventLog.V(1).Info("no pod owns this cgroup, skipping", "reason", err.Error())
-		ReportErrorsTotal.WithLabelValues("resolve_pod").Inc()
+		ReportErrorsTotal.WithLabelValues(StageNoPod).Inc()
 		return
 	}
 
@@ -306,7 +404,7 @@ func (a *Agent) handleCrashEvent(ctx context.Context, event CrashEvent, reporter
 	// Off by default: see Config.CaptureLogs for why.
 	var logLines []string
 	if a.cfg.CaptureLogs {
-		logLines, err = capturer.CaptureLogTail(podMeta.PodUID, podMeta.Namespace, podMeta.PodName, podMeta.ContainerName)
+		logLines, err = capturer.CaptureLogTail(podMeta)
 		if err != nil {
 			eventLog.Error(err, "failed to capture log tail, continuing with empty logs")
 			LogCaptureFailuresTotal.WithLabelValues(podMeta.Namespace).Inc()
@@ -316,8 +414,17 @@ func (a *Agent) handleCrashEvent(ctx context.Context, event CrashEvent, reporter
 
 	// Create the PodCrashReport CRD.
 	if err := reporter.CreateCrashReport(ctx, event, podMeta, logLines); err != nil {
+		var statusErr *StatusWriteError
+		if errors.As(err, &statusErr) {
+			// The report exists but carries no diagnostics, and nothing will ever
+			// fill them in. It is counted separately because the operator sees a
+			// report — it just has zeroes in it — rather than nothing at all.
+			eventLog.Error(err, "PodCrashReport was created but its diagnostics could not be attached")
+			ReportErrorsTotal.WithLabelValues(StageStatus).Inc()
+			return
+		}
 		eventLog.Error(err, "failed to create PodCrashReport")
-		ReportErrorsTotal.WithLabelValues("create").Inc()
+		ReportErrorsTotal.WithLabelValues(StageCreate).Inc()
 		return
 	}
 
