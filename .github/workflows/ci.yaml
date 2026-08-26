@@ -78,7 +78,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.6.2
+          version: v2.13.1
 
   # The eBPF object is a committed binary embedded into the agent, so a change
   # to it ships kernel-level code with no source-level review signal. This
