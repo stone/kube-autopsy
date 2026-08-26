@@ -45,9 +45,9 @@ func (e *StatusWriteError) Unwrap() error { return e.Err }
 // cannot be relied on to skip every victim that belongs to no pod — the budget
 // has to be affordable even when it does not.
 var resolveRetryBackoff = wait.Backoff{
-	Duration: 100 * time.Millisecond,
+	Duration: 200 * time.Millisecond,
 	Factor:   2,
-	Steps:    3, // one immediate attempt, then ~100ms and ~200ms
+	Steps:    6, // ~6 seconds total
 }
 
 // statusWriteBackoff bounds retries of the diagnostics write. A dropped
@@ -311,6 +311,11 @@ func anyContainerIDPending(pods []corev1.Pod) bool {
 				// Terminated with no ID is a container that never started, not one
 				// still being registered, so only waiting and running count.
 				if cs.ContainerID == "" && cs.State.Terminated == nil {
+					return true
+				}
+				// If a container is in a Waiting state (like CrashLoopBackOff), it might be
+				// starting a new incarnation whose container ID has not yet reached the API server.
+				if cs.State.Waiting != nil {
 					return true
 				}
 			}
