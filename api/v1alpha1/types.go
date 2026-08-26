@@ -34,6 +34,13 @@ const (
 	OOMContextNodeExhaustion = "NodeExhaustion"
 )
 
+// MaxLogLines is the largest number of log lines a report may carry. It must
+// stay in step with the MaxItems marker on DiagnosticData.LastLogLines below:
+// the API server rejects an over-long list outright, which fails the status
+// write and takes every other diagnostic down with the logs. A test asserts the
+// two agree.
+const MaxLogLines = 200
+
 // PodCrashReportSpec defines the desired state of PodCrashReport.
 type PodCrashReportSpec struct {
 	// PodName is the name of the crashed pod.
@@ -87,9 +94,11 @@ type DiagnosticData struct {
 	// capacity, not a measure of what the victim was using — see
 	// VictimRSSBytes for that.
 	OOMScopeLimitBytes int64 `json:"oomScopeLimitBytes,omitempty"`
-	// VictimRSSBytes is the victim's resident set size (anonymous plus
-	// file-backed) at the moment the OOM killer selected it. It is omitted when
-	// the running kernel's memory layout was not recognised.
+	// VictimRSSBytes is the victim's resident set size at the moment the OOM
+	// killer selected it: anonymous plus file-backed plus shared memory, which
+	// is what the kernel's own get_mm_rss() counts and what oom_badness() scores
+	// the victim on. It is omitted when the running kernel's memory layout was
+	// not recognised.
 	VictimRSSBytes int64 `json:"victimRssBytes,omitempty"`
 	// OOMVictimPID is the PID of the process killed by the OOM killer.
 	OOMVictimPID int32 `json:"oomVictimPid,omitempty"`
@@ -123,9 +132,22 @@ type DiagnosticData struct {
 }
 
 // RSSDissection breaks down the Resident Set Size usage.
+//
+// AnonRSSBytes, FileRSSBytes and ShmemRSSBytes sum to VictimRSSBytes. Adding
+// SwapBytes and PageTablesBytes gives the figure the kernel scored the victim
+// on, which is reported separately as OOMScore.
 type RSSDissection struct {
-	AnonRSSBytes    int64 `json:"anonRssBytes,omitempty"`
-	FileRSSBytes    int64 `json:"fileRssBytes,omitempty"`
+	AnonRSSBytes int64 `json:"anonRssBytes,omitempty"`
+	FileRSSBytes int64 `json:"fileRssBytes,omitempty"`
+	// ShmemRSSBytes is resident shared memory mapped into the victim: SysV and
+	// POSIX shared memory, and mapped tmpfs such as /dev/shm. Workloads built
+	// around shared memory — Postgres, and anything using a shared buffer pool —
+	// look far smaller than they are without it.
+	ShmemRSSBytes int64 `json:"shmemRssBytes,omitempty"`
+	// SwapBytes is memory the victim had swapped out. It is not resident, so it
+	// is not part of VictimRSSBytes, but the OOM killer counts it against the
+	// victim.
+	SwapBytes       int64 `json:"swapBytes,omitempty"`
 	PageTablesBytes int64 `json:"pageTablesBytes,omitempty"`
 }
 

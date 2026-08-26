@@ -38,6 +38,25 @@ spec:
             - name: metrics
               containerPort: 8443
               protocol: TCP
+            - name: health
+              containerPort: 8081
+              protocol: TCP
+          # Readiness reports whether the kprobe is actually attached, not just
+          # whether the process started. Without it a node whose agent loaded but
+          # never attached looks identical to a healthy one, and an empty report
+          # list reads as "nothing crashed" rather than "not watching".
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
           env:
             - name: NODE_NAME
               valueFrom:

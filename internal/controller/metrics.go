@@ -153,6 +153,50 @@ var (
 		},
 		[]string{"comm"},
 	)
+
+	// WebhookDeliveriesTotal counts webhook delivery outcomes. Without it an
+	// endpoint that has been failing for a week is invisible: the give-up path
+	// leaves only a log line, and a report whose alert was dropped is otherwise
+	// indistinguishable from one that was delivered.
+	//
+	// result is "success", "retry" (failed, will be retried) or "dropped" (the
+	// retry window expired and the alert was lost).
+	WebhookDeliveriesTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "kube_autopsy_webhook_deliveries_total",
+			Help: "Webhook delivery attempts by outcome.",
+		},
+		[]string{"result"},
+	)
+
+	// WebhookDurationSeconds measures how long delivery takes. Delivery blocks a
+	// reconcile worker, so its latency is also the controller's throughput.
+	WebhookDurationSeconds = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "kube_autopsy_webhook_duration_seconds",
+			Help:    "Time spent delivering a webhook notification, in seconds.",
+			Buckets: []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
+		},
+	)
+
+	// ReportsTrimmedTotal counts reports deleted to honour --max-reports rather
+	// than because they aged out, so trimming is never silent.
+	ReportsTrimmedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "kube_autopsy_reports_trimmed_total",
+			Help: "Reports deleted because the cluster-wide report cap was reached.",
+		},
+	)
+
+	// GCErrorsTotal counts reports the collector failed to delete. A report that
+	// cannot be deleted is retried every pass forever, so a non-zero rate here
+	// means retention is not actually being enforced.
+	GCErrorsTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "kube_autopsy_gc_errors_total",
+			Help: "Failed PodCrashReport deletions during garbage collection.",
+		},
+	)
 )
 
 // RegisterMetrics registers all kube-autopsy Prometheus metrics with the
@@ -164,5 +208,9 @@ func RegisterMetrics() {
 		ReportAgeSeconds,
 		VictimAnonRSSBytes,
 		TriggerProcessesTotal,
+		WebhookDeliveriesTotal,
+		WebhookDurationSeconds,
+		ReportsTrimmedTotal,
+		GCErrorsTotal,
 	)
 }

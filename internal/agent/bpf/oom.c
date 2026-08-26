@@ -37,6 +37,14 @@ struct oom_event {
     u64 scope_total_pages;
     u64 anon_rss_pages;  // Victim anonymous RSS, in pages
     u64 file_rss_pages;  // Victim file-backed RSS, in pages
+    // Victim shared-memory RSS, in pages. The kernel's get_mm_rss() is
+    // file + anon + shmem, and oom_badness() scores the victim on that total, so
+    // omitting this made victim_rss disagree with the oom_score reported beside
+    // it for any workload with mapped shared memory (Postgres shared buffers,
+    // SysV/POSIX shm, mmap'd /dev/shm).
+    u64 shmem_rss_pages;
+    // Victim swap entries, in pages. Also part of oom_badness()'s total.
+    u64 swap_pages;
     u64 pgtables_bytes;  // Victim page tables, already in bytes
     char cgroup_name[128]; // Cgroup directory name
     bool is_global_oom;  // True if node exhaustion
@@ -68,6 +76,16 @@ struct mm_rss_stat___pre62 {
 struct mm_struct___pre62 {
     struct mm_rss_stat___pre62 rss_stat;
 };
+
+// clamp_counter turns a kernel page counter into a non-negative value. Both the
+// pre-6.2 atomic counters and the percpu_counter batched totals can read
+// transiently negative while a task is tearing down, and the kernel clamps them
+// the same way in get_mm_counter(). Without this a negative count would be cast
+// to a huge u64 and published as a nonsensical byte figure.
+static __always_inline u64 clamp_counter(long value)
+{
+    return value < 0 ? 0 : (u64)value;
+}
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -143,10 +161,16 @@ int BPF_KPROBE(kprobe__oom_kill_process, struct oom_control *oc, const char *mes
             long count = 0;
 
             bpf_core_read(&count, sizeof(count), &mm_old->rss_stat.count[MM_FILEPAGES]);
-            event->file_rss_pages = (u64)count;
+            event->file_rss_pages = clamp_counter(count);
 
             bpf_core_read(&count, sizeof(count), &mm_old->rss_stat.count[MM_ANONPAGES]);
-            event->anon_rss_pages = (u64)count;
+            event->anon_rss_pages = clamp_counter(count);
+
+            bpf_core_read(&count, sizeof(count), &mm_old->rss_stat.count[MM_SHMEMPAGES]);
+            event->shmem_rss_pages = clamp_counter(count);
+
+            bpf_core_read(&count, sizeof(count), &mm_old->rss_stat.count[MM_SWAPENTS]);
+            event->swap_pages = clamp_counter(count);
 
             event->rss_valid = true;
         } else if (bpf_core_field_exists(mm->rss_stat)) {
@@ -156,10 +180,16 @@ int BPF_KPROBE(kprobe__oom_kill_process, struct oom_control *oc, const char *mes
             s64 count = 0;
 
             bpf_core_read(&count, sizeof(count), &mm->rss_stat[MM_FILEPAGES].count);
-            event->file_rss_pages = (u64)count;
+            event->file_rss_pages = clamp_counter(count);
 
             bpf_core_read(&count, sizeof(count), &mm->rss_stat[MM_ANONPAGES].count);
-            event->anon_rss_pages = (u64)count;
+            event->anon_rss_pages = clamp_counter(count);
+
+            bpf_core_read(&count, sizeof(count), &mm->rss_stat[MM_SHMEMPAGES].count);
+            event->shmem_rss_pages = clamp_counter(count);
+
+            bpf_core_read(&count, sizeof(count), &mm->rss_stat[MM_SWAPENTS].count);
+            event->swap_pages = clamp_counter(count);
 
             event->rss_valid = true;
         }

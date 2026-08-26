@@ -2,15 +2,63 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	autopsy "github.com/kube-autopsy/kube-autopsy/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+// PodListError reports that the pods on this node could not be read at all,
+// as opposed to being read successfully and containing no match. The two used
+// to be indistinguishable to the caller, which meant a broken informer looked
+// exactly like a quiet node.
+type PodListError struct{ Err error }
+
+func (e *PodListError) Error() string { return "failed to list pods: " + e.Err.Error() }
+func (e *PodListError) Unwrap() error { return e.Err }
+
+// StatusWriteError reports that the report was created but its diagnostics
+// could not be attached, leaving an object with an empty status that nothing
+// will ever fill in.
+type StatusWriteError struct{ Err error }
+
+func (e *StatusWriteError) Error() string { return "failed to write report status: " + e.Err.Error() }
+func (e *StatusWriteError) Unwrap() error { return e.Err }
+
+// resolveRetryBackoff bounds how long ResolvePodMeta waits for the kubelet to
+// publish a container ID. A container with a tight memory limit can be killed a
+// few hundred milliseconds after it starts, before its containerID reaches
+// status — and a single lookup then discards the crash permanently, which is
+// exactly the crash the operator most wants to see.
+// The budget is deliberately small. Each attempt holds one of the
+// MaxConcurrentReports slots, and the reader goroutine blocks on that semaphore,
+// so time spent here is time the ring buffer is not being drained. The pending
+// -container-ID guard below narrows *when* this runs but is node-wide, so it
+// cannot be relied on to skip every victim that belongs to no pod — the budget
+// has to be affordable even when it does not.
+var resolveRetryBackoff = wait.Backoff{
+	Duration: 100 * time.Millisecond,
+	Factor:   2,
+	Steps:    3, // one immediate attempt, then ~100ms and ~200ms
+}
+
+// statusWriteBackoff bounds retries of the diagnostics write. A dropped
+// connection during an OOM storm would otherwise strand the report with no
+// diagnostics at all — not just no logs, but no memory figures either.
+var statusWriteBackoff = wait.Backoff{
+	Duration: 100 * time.Millisecond,
+	Factor:   2,
+	Jitter:   0.1,
+	Steps:    4,
+}
 
 // PodMeta contains the Kubernetes metadata for a pod, resolved from its UID.
 type PodMeta struct {
@@ -22,6 +70,13 @@ type PodMeta struct {
 	ContainerName string
 	// PodUID is the UID of the pod.
 	PodUID string
+	// LogFileIndex identifies which of the container's log files belongs to the
+	// incarnation that was killed. The kubelet names them by restart count —
+	// 0.log, 1.log — and all incarnations share one directory, so after a
+	// restart the newest file is the replacement's, not the victim's. Reading
+	// that one would attach a live process's startup output to a post-mortem.
+	// Negative means unknown, in which case the newest file is used.
+	LogFileIndex int
 }
 
 // Reporter creates PodCrashReport CRD instances in the Kubernetes API.
@@ -119,49 +174,184 @@ func (r *Reporter) CreateCrashReport(ctx context.Context, event CrashEvent, podM
 		diagnostics.RSSDissection = &autopsy.RSSDissection{
 			AnonRSSBytes:    event.AnonRSSBytes,
 			FileRSSBytes:    event.FileRSSBytes,
+			ShmemRSSBytes:   event.ShmemRSSBytes,
+			SwapBytes:       event.SwapBytes,
 			PageTablesBytes: event.PageTablesBytes,
 		}
 	}
 
 	report.Status = autopsy.PodCrashReportStatus{
 		Diagnostics: diagnostics,
-		Phase:       "Pending",
+		Phase:       autopsy.PhasePending,
 	}
 
-	if err := r.client.Status().Patch(ctx, report, patch); err != nil {
-		return fmt.Errorf("failed to update PodCrashReport status %s/%s: %w", podMeta.Namespace, report.Name, err)
+	// Retried, because this write is the one that carries every diagnostic. If it
+	// is lost the report still exists, so the controller will happily process it
+	// and notify with zeroes, and there is no path that ever fills it in.
+	var lastErr error
+	err := retryOnBackoff(ctx, statusWriteBackoff, func() (bool, error) {
+		if err := r.client.Status().Patch(ctx, report, patch); err != nil {
+			if !isRetryableStatusError(err) {
+				return false, &StatusWriteError{Err: fmt.Errorf(
+					"%s/%s: %w", podMeta.Namespace, report.Name, err)}
+			}
+			lastErr = err
+			return false, nil
+		}
+		// Cleared, so a success after one or more retryable failures is not
+		// reported as a failure.
+		lastErr = nil
+		return true, nil
+	})
+	if err != nil {
+		return err
+	}
+	if lastErr != nil {
+		return &StatusWriteError{Err: fmt.Errorf(
+			"%s/%s: %w", podMeta.Namespace, report.Name, lastErr)}
 	}
 
 	return nil
 }
 
+// isRetryableStatusError reports whether re-issuing the status write could
+// plausibly succeed. A schema violation or a revoked permission fails
+// identically every time, so retrying it only delays the error.
+//
+// Conflict is deliberately absent. The patch carries an optimistic-lock
+// precondition on the resourceVersion returned by Create, and the agent is not
+// granted "get" on podcrashreports, so it cannot re-read the object to refresh
+// that base — replaying the same patch could only conflict again. A conflict
+// here also means something else has written to a report the agent created
+// moments ago, which is worth surfacing rather than papering over.
+func isRetryableStatusError(err error) bool {
+	var status apierrors.APIStatus
+	if !errors.As(err, &status) {
+		// No API status at all means the request never reached a verdict — a
+		// dropped connection, a DNS blip — which is worth another go.
+		return true
+	}
+
+	return apierrors.IsServerTimeout(err) ||
+		apierrors.IsTimeout(err) ||
+		apierrors.IsTooManyRequests(err) ||
+		apierrors.IsInternalError(err) ||
+		apierrors.IsServiceUnavailable(err)
+}
+
 // ResolvePodMeta uses the Kubernetes API to find the pod matching the given event
 // and returns its metadata including the name of the container that matches the
 // crash event's container ID.
+// It retries briefly: the kubelet publishes a container's ID asynchronously, so
+// a container killed moments after starting may not carry one yet, and the
+// agent's informer can lag a little behind the API server besides. A single
+// lookup discarded those crashes permanently.
 func (r *Reporter) ResolvePodMeta(ctx context.Context, event CrashEvent) (PodMeta, error) {
-	// List all pods on this node to find the matching UID.
-	var podList corev1.PodList
-	if err := r.client.List(ctx, &podList, client.MatchingFields{
-		"spec.nodeName": r.nodeName,
-	}); err != nil {
-		return PodMeta{}, fmt.Errorf("failed to list pods on node %s: %w", r.nodeName, err)
-	}
+	var meta PodMeta
 
-	for _, pod := range podList.Items {
-		containerName := findContainerByID(pod, event.ContainerID)
-		if containerName != "" {
-			// Found the pod containing this container!
-			// We populate PodUID so the rest of the flow can use it
-			return PodMeta{
-				PodName:       pod.Name,
-				Namespace:     pod.Namespace,
-				ContainerName: containerName,
-				PodUID:        string(pod.UID),
-			}, nil
+	err := retryOnBackoff(ctx, resolveRetryBackoff, func() (bool, error) {
+		// List all pods on this node to find the matching UID.
+		var podList corev1.PodList
+		if err := r.client.List(ctx, &podList, client.MatchingFields{
+			"spec.nodeName": r.nodeName,
+		}); err != nil {
+			// Terminal: a listing failure is not something waiting fixes, and it
+			// must reach the caller as itself rather than as "no pod found".
+			return false, &PodListError{Err: fmt.Errorf("on node %s: %w", r.nodeName, err)}
+		}
+
+		for _, pod := range podList.Items {
+			containerName, logIndex := findContainerByID(pod, event.ContainerID)
+			if containerName != "" {
+				// Found the pod containing this container!
+				// We populate PodUID so the rest of the flow can use it
+				meta = PodMeta{
+					PodName:       pod.Name,
+					Namespace:     pod.Namespace,
+					ContainerName: containerName,
+					PodUID:        string(pod.UID),
+					LogFileIndex:  logIndex,
+				}
+				return true, nil
+			}
+		}
+
+		// No match. Retrying is only worth it while some container on this node
+		// has yet to be given an ID — that is the race being waited out. When
+		// every ID is published the answer is already final, and this event is a
+		// victim that belongs to no pod: a systemd unit, sshd, the kubelet. Those
+		// are the common case during a node-level OOM, and waiting out the full
+		// schedule for each one would hold a concurrency slot for seconds and
+		// throttle the reports that do matter.
+		if !anyContainerIDPending(podList.Items) {
+			return true, nil
+		}
+		return false, nil
+	})
+	if err != nil {
+		return PodMeta{}, err
+	}
+	if meta.PodName == "" {
+		return PodMeta{}, fmt.Errorf("pod with container ID %s not found on node %s", event.ContainerID, r.nodeName)
+	}
+	return meta, nil
+}
+
+// anyContainerIDPending reports whether some container on this node is running
+// or starting without a published container ID — the window in which a crash can
+// arrive before the kubelet has said which container it belongs to.
+func anyContainerIDPending(pods []corev1.Pod) bool {
+	for i := range pods {
+		for _, group := range [][]corev1.ContainerStatus{
+			pods[i].Status.ContainerStatuses,
+			pods[i].Status.InitContainerStatuses,
+			pods[i].Status.EphemeralContainerStatuses,
+		} {
+			for _, cs := range group {
+				// Terminated with no ID is a container that never started, not one
+				// still being registered, so only waiting and running count.
+				if cs.ContainerID == "" && cs.State.Terminated == nil {
+					return true
+				}
+			}
 		}
 	}
+	return false
+}
 
-	return PodMeta{}, fmt.Errorf("pod with container ID %s not found on node %s", event.ContainerID, r.nodeName)
+// retryOnBackoff runs fn until it reports success, its retries are exhausted, or
+// ctx is cancelled. Unlike wait.ExponentialBackoff it does not sleep after the
+// final attempt, and it respects cancellation so a shutdown does not have to
+// wait out the whole schedule.
+func retryOnBackoff(ctx context.Context, backoff wait.Backoff, fn func() (bool, error)) error {
+	delay := backoff.Duration
+	for attempt := 0; attempt < backoff.Steps; attempt++ {
+		if attempt > 0 {
+			// wait.Jitter is applied to the sleep but not carried into the next
+			// delay, so the schedule stays exponential rather than compounding.
+			sleep := delay
+			if backoff.Jitter > 0 {
+				sleep = wait.Jitter(delay, backoff.Jitter)
+			}
+			timer := time.NewTimer(sleep)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			}
+			delay = time.Duration(float64(delay) * backoff.Factor)
+		}
+
+		done, err := fn()
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+	}
+	return nil
 }
 
 // setOwnerReference sets the pod as the owner of the PodCrashReport, so the
@@ -191,19 +381,35 @@ func setOwnerReference(report *autopsy.PodCrashReport, podMeta PodMeta) {
 }
 
 // findContainerByID inspects a pod's container statuses to find one that matches
-// the given container ID.
-func findContainerByID(pod corev1.Pod, containerID string) string {
+// the given container ID. It returns the container's name and the index of the
+// log file belonging to that incarnation, or ("", -1) when nothing matches.
+//
+// Both the current and the previous incarnation are considered. After a restart
+// the ID of the container that was actually killed has moved to
+// lastState.terminated.containerID, so matching only the live one loses exactly
+// the reports a crash-looping container should produce. The log index tracks
+// which one matched, because the incarnations share a log directory and the
+// newest file belongs to whichever is running now.
+func findContainerByID(pod corev1.Pod, containerID string) (string, int) {
 	statuses := make([]corev1.ContainerStatus, 0, len(pod.Status.ContainerStatuses)+len(pod.Status.InitContainerStatuses)+len(pod.Status.EphemeralContainerStatuses))
 	statuses = append(statuses, pod.Status.ContainerStatuses...)
 	statuses = append(statuses, pod.Status.InitContainerStatuses...)
 	statuses = append(statuses, pod.Status.EphemeralContainerStatuses...)
 
 	for _, cs := range statuses {
+		// The kubelet writes <restartCount>.log, so the live container's file is
+		// numbered by its current restart count.
 		if containerIDsMatch(cs.ContainerID, containerID) {
-			return cs.Name
+			return cs.Name, int(cs.RestartCount)
+		}
+		// The previous incarnation ran one restart earlier, so its file is one
+		// lower. RestartCount is only 0 here if the status has not been updated
+		// yet, in which case the index is unknown rather than negative.
+		if t := cs.LastTerminationState.Terminated; t != nil && containerIDsMatch(t.ContainerID, containerID) {
+			return cs.Name, int(cs.RestartCount) - 1
 		}
 	}
-	return ""
+	return "", -1
 }
 
 // containerIDsMatch compares a ContainerStatus ID such as

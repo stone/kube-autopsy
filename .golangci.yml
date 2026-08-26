@@ -1,0 +1,35 @@
+# Pinned configuration rather than golangci-lint's defaults. CI ran with
+# `version: latest` and no config, so a new golangci-lint release could enable a
+# linter and fail an unrelated pull request.
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    # Unchecked errors are how a failed status write or a failed Close goes
+    # unnoticed, which this project has had before.
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    # Context should reach the call that can block, so shutdown is not something
+    # the agent has to wait out.
+    - contextcheck
+    # Error wrapping: %w keeps errors.As working, which the agent relies on to
+    # tell a pod-list failure apart from an unmatched container.
+    - errorlint
+
+  exclusions:
+    rules:
+      # Generated code.
+      - path: (zz_generated\.deepcopy\.go|_bpfel\.go)$
+        linters:
+          - errcheck
+          - staticcheck
+          - unused
+          - errorlint
+
+formatters:
+  enable:
+    - gofmt

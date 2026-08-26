@@ -42,6 +42,12 @@ var (
 
 	// ReportErrorsTotal counts crash events that could not be turned into a
 	// report, partitioned by the stage that failed.
+	//
+	// The stage labels are deliberately narrow. Lumping every resolution outcome
+	// under one "resolve_pod" bucket meant an expected non-pod victim — a global
+	// OOM that took sshd — was indistinguishable from a cluster-wide API failure,
+	// so the counter could not be alerted on in either direction. See the
+	// stage* constants.
 	ReportErrorsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "kube_autopsy_report_errors_total",
@@ -49,6 +55,41 @@ var (
 		},
 		[]string{"stage"},
 	)
+
+	// EventsReceivedTotal counts every OOM event read from the kernel, before
+	// any filtering. It is the denominator that makes the other counters
+	// meaningful: without it, "no reports" cannot be told apart from "no kills".
+	EventsReceivedTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "kube_autopsy_events_received_total",
+			Help: "OOM kill events received from the kernel, before filtering.",
+		},
+	)
+
+	// UnsupportedKernelEventsTotal counts events whose RSS figures the running
+	// kernel's memory layout did not yield, so a node silently producing reports
+	// with no memory breakdown is visible rather than merely disappointing.
+	UnsupportedKernelEventsTotal = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "kube_autopsy_unsupported_kernel_events_total",
+			Help: "OOM events where the kernel's mm_struct layout was not recognised, so RSS figures are absent.",
+		},
+	)
+)
+
+// Stages reported through ReportErrorsTotal.
+const (
+	// StageNoPod is an OOM victim that belongs to no pod on this node — a
+	// systemd unit, sshd, the kubelet. Expected on a node-level OOM, not a
+	// failure, but counted so the ratio against EventsReceivedTotal is visible.
+	StageNoPod = "no_pod"
+	// StageListPods is a failure to list pods from the API/cache.
+	StageListPods = "list_pods"
+	// StageCreate is a failure to create the PodCrashReport.
+	StageCreate = "create"
+	// StageStatus is a failure to attach diagnostics to a report that was
+	// created, which leaves an orphan carrying no diagnostics at all.
+	StageStatus = "status"
 )
 
 // RegisterMetrics registers the agent's metrics with the controller-runtime
@@ -59,5 +100,7 @@ func RegisterMetrics() {
 		LogCaptureFailuresTotal,
 		ReportsSuppressedTotal,
 		ReportErrorsTotal,
+		EventsReceivedTotal,
+		UnsupportedKernelEventsTotal,
 	)
 }

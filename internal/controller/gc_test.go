@@ -51,7 +51,7 @@ func TestDeleteExpiredReports(t *testing.T) {
 		WithObjects(reportExpired, reportFresh, reportBorderline).
 		Build()
 
-	gc := NewGarbageCollector(fakeClient, ttl)
+	gc := NewGarbageCollector(fakeClient, ttl, 0)
 
 	// Inject the metrics registerer to prevent panic if tests run in parallel
 	// though they are globally registered in metrics.go, no setup needed for this basic test.

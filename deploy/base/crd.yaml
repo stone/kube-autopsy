@@ -182,6 +182,21 @@ spec:
                       pageTablesBytes:
                         format: int64
                         type: integer
+                      shmemRssBytes:
+                        description: |-
+                          ShmemRSSBytes is resident shared memory mapped into the victim: SysV and
+                          POSIX shared memory, and mapped tmpfs such as /dev/shm. Workloads built
+                          around shared memory — Postgres, and anything using a shared buffer pool —
+                          look far smaller than they are without it.
+                        format: int64
+                        type: integer
+                      swapBytes:
+                        description: |-
+                          SwapBytes is memory the victim had swapped out. It is not resident, so it
+                          is not part of VictimRSSBytes, but the OOM killer counts it against the
+                          victim.
+                        format: int64
+                        type: integer
                     type: object
                   triggerComm:
                     description: TriggerComm is the name of the process that triggered
@@ -194,9 +209,11 @@ spec:
                     type: integer
                   victimRssBytes:
                     description: |-
-                      VictimRSSBytes is the victim's resident set size (anonymous plus
-                      file-backed) at the moment the OOM killer selected it. It is omitted when
-                      the running kernel's memory layout was not recognised.
+                      VictimRSSBytes is the victim's resident set size at the moment the OOM
+                      killer selected it: anonymous plus file-backed plus shared memory, which
+                      is what the kernel's own get_mm_rss() counts and what oom_badness() scores
+                      the victim on. It is omitted when the running kernel's memory layout was
+                      not recognised.
                     format: int64
                     type: integer
                 type: object

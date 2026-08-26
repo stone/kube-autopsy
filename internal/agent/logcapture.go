@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,8 +10,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
+
+	autopsy "github.com/kube-autopsy/kube-autopsy/api/v1alpha1"
 )
 
 const (
@@ -34,6 +38,9 @@ const (
 
 	// truncationMarker is appended to any line that was shortened.
 	truncationMarker = "…[truncated]"
+
+	// tailChunkSize is how much of the file is read per backwards step.
+	tailChunkSize = 8192
 )
 
 // LogCapturer reads the final log lines from container log files on the host.
@@ -51,11 +58,13 @@ func NewLogCapturer(tailLines int) *LogCapturer {
 	}
 }
 
-// CaptureLogTail reads the last N lines from the container's log file under
+// CaptureLogTail reads the last N lines from the log file of the container
+// incarnation identified by meta, under
 // /var/log/pods/<namespace>_<podName>_<podUID>/<containerName>/. It retries
 // with exponential back-off to handle container runtime teardown races.
-func (lc *LogCapturer) CaptureLogTail(podUID, namespace, podName, containerName string) ([]string, error) {
-	logDir := filepath.Join(podLogBasePath, fmt.Sprintf("%s_%s_%s", namespace, podName, podUID), containerName)
+func (lc *LogCapturer) CaptureLogTail(meta PodMeta) ([]string, error) {
+	logDir := filepath.Join(podLogBasePath,
+		fmt.Sprintf("%s_%s_%s", meta.Namespace, meta.PodName, meta.PodUID), meta.ContainerName)
 
 	var lastErr error
 	delay := logCaptureBaseDelay
@@ -66,7 +75,7 @@ func (lc *LogCapturer) CaptureLogTail(podUID, namespace, podName, containerName 
 			delay *= 2
 		}
 
-		logFile, err := findLatestLogFile(logDir)
+		logFile, err := findLogFile(logDir, meta.LogFileIndex)
 		if err != nil {
 			lastErr = fmt.Errorf("attempt %d: find log file: %w", attempt+1, err)
 			continue
@@ -87,8 +96,10 @@ func (lc *LogCapturer) CaptureLogTail(podUID, namespace, podName, containerName 
 // dockerLogEntry is the docker json-file log format, still produced by the
 // dockershim-era runtimes and by some managed distributions.
 type dockerLogEntry struct {
-	Log    string `json:"log"`
-	Stream string `json:"stream"`
+	// A pointer so an absent "log" key can be told from an empty one; only a
+	// genuine docker entry has the key at all.
+	Log    *string `json:"log"`
+	Stream string  `json:"stream"`
 }
 
 // parseLogLines strips container-runtime framing from raw log file lines and
@@ -100,63 +111,88 @@ type dockerLogEntry struct {
 // carried a timestamp, a stream name and a flag, and long lines appeared cut
 // into fragments.
 //
+// Partials are tracked per stream. stdout and stderr are interleaved in one
+// file, so a single buffer let an stderr line land in the middle of a split
+// stdout line and spliced the two together — corrupting exactly the last-gasp
+// output this exists to capture, since a dying process usually writes to stderr
+// while the application logs to stdout.
+//
 // Lines in an unrecognised format are passed through unchanged rather than
 // dropped: an unfamiliar runtime should degrade to raw output, not to nothing.
 func parseLogLines(raw []string) []string {
 	out := make([]string, 0, len(raw))
-	var partial strings.Builder
+	// Keyed by stream name; kubelet only ever writes stdout and stderr.
+	partials := make(map[string]*strings.Builder, 2)
 
-	flush := func(message string) {
-		if partial.Len() > 0 {
-			partial.WriteString(message)
-			out = append(out, partial.String())
-			partial.Reset()
+	// flush closes any partial open on stream and emits the completed line.
+	flush := func(stream, message string) {
+		if b, ok := partials[stream]; ok {
+			b.WriteString(message)
+			out = append(out, b.String())
+			delete(partials, stream)
 			return
 		}
 		out = append(out, message)
 	}
 
+	// unframed is the stream key for lines with no recognisable framing. They
+	// cannot be attributed to a stream, so they get their own bucket rather than
+	// disturbing an in-flight stdout or stderr partial.
+	const unframed = ""
+
 	for _, line := range raw {
 		if entry, ok := parseDockerLogLine(line); ok {
-			flush(entry)
+			flush(unframed, entry)
 			continue
 		}
 
-		message, isPartial, ok := parseCRILogLine(line)
+		message, stream, isPartial, ok := parseCRILogLine(line)
 		if !ok {
-			// Unknown format: emit as-is, after closing any open partial.
-			flush(line)
+			// Unknown format: emit as-is.
+			flush(unframed, line)
 			continue
 		}
 
 		if isPartial {
-			partial.WriteString(message)
+			b, ok := partials[stream]
+			if !ok {
+				b = &strings.Builder{}
+				partials[stream] = b
+			}
+			b.WriteString(message)
 			continue
 		}
-		flush(message)
+		flush(stream, message)
 	}
 
 	// A container killed mid-line leaves a partial with no terminating full
-	// line. That fragment is often the most interesting thing in the file.
-	if partial.Len() > 0 {
-		out = append(out, partial.String())
+	// line. That fragment is often the most interesting thing in the file, so it
+	// is emitted rather than discarded. Sorted so the output is deterministic
+	// when both streams were mid-line.
+	openStreams := make([]string, 0, len(partials))
+	for stream := range partials {
+		openStreams = append(openStreams, stream)
+	}
+	sort.Strings(openStreams)
+	for _, stream := range openStreams {
+		out = append(out, partials[stream].String())
 	}
 
 	return out
 }
 
-// parseCRILogLine splits a CRI-format log line into its message, reporting
-// whether the runtime marked it as a partial line.
-func parseCRILogLine(line string) (message string, isPartial bool, ok bool) {
+// parseCRILogLine splits a CRI-format log line into its message and stream,
+// reporting whether the runtime marked it as a partial line.
+func parseCRILogLine(line string) (message, stream string, isPartial, ok bool) {
 	// <timestamp> <stream> <tag> <message>; the message itself may contain
 	// spaces, so only the first three fields are split off.
 	timestamp, rest, found := strings.Cut(line, " ")
 	if !found {
-		return "", false, false
+		return "", "", false, false
 	}
-	stream, rest, found := strings.Cut(rest, " ")
+	stream, rest, found = strings.Cut(rest, " ")
 	if !found {
-		return "", false, false
+		return "", "", false, false
 	}
 	tag, message, found := strings.Cut(rest, " ")
 	if !found {
@@ -165,19 +201,19 @@ func parseCRILogLine(line string) (message string, isPartial bool, ok bool) {
 	}
 
 	if stream != "stdout" && stream != "stderr" {
-		return "", false, false
+		return "", "", false, false
 	}
 	// The tag field is "F" or "P", optionally followed by ":"-separated flags.
 	baseTag, _, _ := strings.Cut(tag, ":")
 	if baseTag != "F" && baseTag != "P" {
-		return "", false, false
+		return "", "", false, false
 	}
 	// Guard against a plain log line that happens to have this shape.
 	if _, err := time.Parse(time.RFC3339Nano, timestamp); err != nil {
-		return "", false, false
+		return "", "", false, false
 	}
 
-	return message, baseTag == "P", true
+	return message, stream, baseTag == "P", true
 }
 
 // parseDockerLogLine extracts the message from a docker json-file log line.
@@ -190,20 +226,45 @@ func parseDockerLogLine(line string) (string, bool) {
 	if err := json.Unmarshal([]byte(line), &entry); err != nil {
 		return "", false
 	}
-	if entry.Stream == "" {
+	// Only stdout and stderr, matching parseCRILogLine. Accepting any non-empty
+	// value meant a structured application log that happened to carry its own
+	// "stream" field was claimed as docker framing and replaced by its (absent)
+	// "log" key — turning a fatal message into an empty line.
+	if entry.Stream != "stdout" && entry.Stream != "stderr" {
 		return "", false
 	}
-	return strings.TrimSuffix(entry.Log, "\n"), true
+	if entry.Log == nil {
+		return "", false
+	}
+	return strings.TrimSuffix(*entry.Log, "\n"), true
 }
 
 // truncateLines bounds captured log output so a report can always be written.
-// Individual lines are shortened to maxLogLineBytes and the set is cut off once
-// it reaches maxLogTotalBytes, keeping the earliest lines of the tail. Cuts are
-// made on rune boundaries so the result stays valid UTF-8, which the API server
-// requires of a string field.
+// Individual lines are shortened to maxLogLineBytes, the set is cut off once it
+// reaches maxLogTotalBytes, and the number of entries is capped at
+// autopsy.MaxLogLines. Cuts are made on rune boundaries so the result stays
+// valid UTF-8, which the API server requires of a string field.
+//
+// The item cap matters as much as the byte cap: the CRD rejects a longer list
+// outright, and because every diagnostic is written in one status patch, that
+// rejection costs the memory figures and OOM scores as well as the logs.
+// Config.Validate keeps --log-tail-lines within the same bound, so this is the
+// second of two independent guards on the same limit.
 func truncateLines(lines []string) []string {
 	if len(lines) == 0 {
 		return lines
+	}
+
+	// Keep the tail: the lines closest to the kill are the interesting ones.
+	// The marker prepended below occupies one of the permitted entries and some
+	// of the byte budget, so room is reserved for it here rather than discovered
+	// afterwards — otherwise adding it would itself breach the cap.
+	dropped := false
+	budget := maxLogTotalBytes
+	if len(lines) > autopsy.MaxLogLines {
+		lines = lines[len(lines)-(autopsy.MaxLogLines-1):]
+		dropped = true
+		budget -= len(truncationMarker)
 	}
 
 	out := make([]string, 0, len(lines))
@@ -213,12 +274,16 @@ func truncateLines(lines []string) []string {
 		if len(line) > maxLogLineBytes {
 			line = trimToValidUTF8(line, maxLogLineBytes) + truncationMarker
 		}
-		if total+len(line) > maxLogTotalBytes {
+		if total+len(line) > budget {
 			out = append(out, truncationMarker)
 			break
 		}
 		out = append(out, line)
 		total += len(line)
+	}
+
+	if dropped {
+		out = append([]string{truncationMarker}, out...)
 	}
 
 	return out
@@ -235,6 +300,33 @@ func trimToValidUTF8(s string, limit int) string {
 	return s[:limit]
 }
 
+// findLogFile locates the log file for one container incarnation. The kubelet
+// names them by restart count — 0.log, 1.log — and every incarnation of a
+// container shares the directory, so asking for the newest file returns the
+// running container's log once the victim has been replaced. index selects the
+// incarnation; a negative index means it could not be determined, and the newest
+// file is used.
+//
+// A named index that is absent is an error rather than a fallback: the victim's
+// log has been rotated away, and the replacement's output is not a post-mortem
+// of the process that died.
+func findLogFile(logDir string, index int) (string, error) {
+	if index < 0 {
+		return findLatestLogFile(logDir)
+	}
+
+	path := filepath.Join(logDir, strconv.Itoa(index)+".log")
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", fmt.Errorf("log file for incarnation %d of %s: %w", index, logDir, err)
+	}
+	// Symlinks are refused here for the same reason as in findLatestLogFile.
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("%s is a symlink, refusing to follow it", path)
+	}
+	return path, nil
+}
+
 // findLatestLogFile finds the most recent log file in the given directory.
 // Container runtimes name log files with numeric suffixes (e.g., 0.log, 1.log)
 // where higher numbers are more recent.
@@ -245,13 +337,35 @@ func findLatestLogFile(logDir string) (string, error) {
 	}
 
 	var logFiles []os.DirEntry
+	symlinks := 0
 	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".log") {
-			logFiles = append(logFiles, entry)
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".log") {
+			continue
 		}
+		// A symlink here is not something a current kubelet creates. Following
+		// one would let anything that can write into /var/log — a log shipper
+		// with the conventional read-write hostPath is the realistic case —
+		// point the agent at a file of its choosing and have the contents
+		// published in a PodCrashReport, which is readable with only
+		// "get podcrashreports".
+		if entry.Type()&os.ModeSymlink != 0 {
+			symlinks++
+			continue
+		}
+		logFiles = append(logFiles, entry)
 	}
 
 	if len(logFiles) == 0 {
+		if symlinks > 0 {
+			// The dockershim-era layout symlinked these into
+			// /var/lib/docker/containers, which the agent does not mount and so
+			// could never have read anyway. Saying so beats "no log files found",
+			// which would send someone looking for a file that is right there.
+			return "", fmt.Errorf(
+				"the %d log file(s) in %s are symlinks, which are not followed; "+
+					"this layout stores the real files outside /var/log/pods, where "+
+					"the agent has no access", symlinks, logDir)
+		}
 		return "", fmt.Errorf("no log files found in %s", logDir)
 	}
 
@@ -276,9 +390,17 @@ func extractLogNumber(name string) int {
 	return n
 }
 
-// tailFile reads the last N lines from a file using an efficient reverse-read
-// strategy. It reads from the end of the file in chunks to avoid loading the
-// entire file into memory.
+// tailFile reads the last N lines from a file by walking backwards in chunks,
+// so an enormous log costs no more than the tail that is actually wanted.
+//
+// Two bounds stop it degenerating. Chunks are collected in reverse and joined
+// once at the end: the previous version re-appended the whole accumulation on
+// every iteration, which is quadratic — a 64MiB file with no newlines took 45
+// seconds and allocated 262GB. And maxReadBytes caps the scan outright, because
+// the newline count alone is not a bound: a file with no newlines is read in
+// full, and the agent has a 128Mi memory limit. In practice CRI framing splits
+// lines at roughly 16KiB so neither is reached, but nothing in the file format
+// guarantees that.
 func tailFile(path string, lines int) ([]string, error) {
 	// Defence in depth: Config.Validate rejects this, but a non-positive count
 	// would otherwise index past the end of the slice below.
@@ -286,7 +408,8 @@ func tailFile(path string, lines int) ([]string, error) {
 		return nil, fmt.Errorf("tail line count must be at least 1, got %d", lines)
 	}
 
-	f, err := os.Open(path)
+	// Read-only and never following a symlink: see findLatestLogFile.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open %s: %w", path, err)
 	}
@@ -297,20 +420,29 @@ func tailFile(path string, lines int) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to stat %s: %w", path, err)
 	}
+	// A directory, device or fifo in place of the log file is not something the
+	// kubelet produces, and reading one could block indefinitely.
+	if !stat.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", path)
+	}
 
 	fileSize := stat.Size()
 	if fileSize == 0 {
 		return []string{}, nil
 	}
 
-	// Read the file from the end in chunks.
-	const chunkSize = 8192
-	var collected []byte
+	// Cap the scan at what the requested lines could plausibly occupy, with
+	// generous headroom for framing, plus one chunk so a short file is never
+	// truncated by the cap alone.
+	maxReadBytes := int64(lines)*maxLogLineBytes*2 + tailChunkSize
+
+	chunks := make([][]byte, 0, 8)
 	remaining := fileSize
+	read := int64(0)
 	lineCount := 0
 
-	for remaining > 0 && lineCount <= lines {
-		readSize := int64(chunkSize)
+	for remaining > 0 && lineCount <= lines && read < maxReadBytes {
+		readSize := int64(tailChunkSize)
 		if readSize > remaining {
 			readSize = remaining
 		}
@@ -323,15 +455,22 @@ func tailFile(path string, lines int) ([]string, error) {
 		}
 		chunk = chunk[:n]
 
-		// Count newlines in this chunk.
-		for _, b := range chunk {
-			if b == '\n' {
-				lineCount++
-			}
-		}
+		lineCount += bytes.Count(chunk, []byte{'\n'})
 
-		collected = append(chunk, collected...)
+		// Prepended once at the end rather than on every iteration.
+		chunks = append(chunks, chunk)
 		remaining = offset
+		read += int64(n)
+	}
+
+	// chunks holds the file's tail in reverse order.
+	total := 0
+	for _, c := range chunks {
+		total += len(c)
+	}
+	collected := make([]byte, 0, total)
+	for i := len(chunks) - 1; i >= 0; i-- {
+		collected = append(collected, chunks[i]...)
 	}
 
 	// Split into lines and return the last N.
@@ -340,6 +479,12 @@ func tailFile(path string, lines int) ([]string, error) {
 	// Remove trailing empty line from final newline.
 	if len(allLines) > 0 && allLines[len(allLines)-1] == "" {
 		allLines = allLines[:len(allLines)-1]
+	}
+
+	// The scan may have stopped mid-line, either at the read cap or at the start
+	// of the file; drop that leading fragment unless it is all there is.
+	if remaining > 0 && len(allLines) > 1 {
+		allLines = allLines[1:]
 	}
 
 	if len(allLines) <= lines {

@@ -74,7 +74,9 @@ func TestLoadFromEnv(t *testing.T) {
 	t.Setenv("KUBE_AUTOPSY_WEBHOOK_URL", "https://hooks.slack.com/test")
 	t.Setenv("KUBE_AUTOPSY_LEADER_ELECT", "false")
 
-	cfg.LoadFromEnv()
+	if err := cfg.LoadFromEnv(); err != nil {
+		t.Fatalf("LoadFromEnv returned an error: %v", err)
+	}
 
 	if cfg.TTLHours != 72 {
 		t.Errorf("expected TTLHours to be 72, got %d", cfg.TTLHours)
@@ -85,6 +87,18 @@ func TestLoadFromEnv(t *testing.T) {
 	if cfg.MetricsBindAddr != ":9091" {
 		t.Errorf("expected MetricsBindAddr to be :9091, got %s", cfg.MetricsBindAddr)
 	}
+	// The webhook URL is deliberately withheld from WebhookURL until
+	// ResolveSecrets runs: binding it before flags are registered would make it
+	// a flag default, and flag.PrintDefaults publishes every default.
+	if cfg.WebhookURL != "" {
+		t.Errorf("expected WebhookURL to stay empty until ResolveSecrets, got %s", cfg.WebhookURL)
+	}
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	cfg.BindFlags(fs)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("failed to parse flags: %v", err)
+	}
+	cfg.ResolveSecrets(fs)
 	if cfg.WebhookURL != "https://hooks.slack.com/test" {
 		t.Errorf("expected WebhookURL to be https://hooks.slack.com/test, got %s", cfg.WebhookURL)
 	}

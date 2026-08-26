@@ -1,0 +1,10 @@
+# `make build` output.
+/bin/
+
+# Release artefacts, produced by the release workflow.
+/install.yaml
+/install-hardened.yaml
+/sbom.spdx.json
+
+# Local coverage output.
+*.out

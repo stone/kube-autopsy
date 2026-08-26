@@ -12,8 +12,25 @@ runbooks from them.
 
 The controller can also dispatch directly, given a URL in the
 `kube-autopsy-webhook` Secret (see
-[Webhook credentials](security.md#webhook-credentials)). It sends JSON, or a
-formatted Slack message when the endpoint's *host* is Slack:
+[Webhook credentials](security.md#webhook-credentials)). It sends this JSON:
+
+```json
+{
+  "podName": "oom-victim",
+  "namespace": "default",
+  "containerName": "hogger",
+  "nodeName": "node-1",
+  "reason": "OOMKilled",
+  "exitCode": 137,
+  "timestamp": "2026-07-18T13:24:28Z",
+  "victimRssMB": 60,
+  "oomScopeLimitMB": 64,
+  "lastLogLines": ["…"]
+}
+```
+
+`lastLogLines` is present only with `--webhook-include-logs`. When the
+endpoint's *host* is Slack, a formatted message is sent instead:
 
 ```
 🚨 Pod Crash Detected
@@ -44,20 +61,52 @@ kubectl create clusterrolebinding kube-autopsy-prometheus \
   --serviceaccount=monitoring:prometheus
 ```
 
+The TLS certificate is self-signed and issued for `localhost`, so a scraper
+connecting to the pod IP will not verify it. Set `insecureSkipVerify: true` in
+the scrape config (the connection is still encrypted, and the
+`SubjectAccessReview` is what actually authorises the scrape), or mount your own
+certificate.
+
 From the controller:
 
-- `kube_autopsy_reports_created_total` (Counter; `namespace`, `node`, `reason`) — crash volume.
+- `kube_autopsy_reports_created_total` (Counter; `namespace`, `node`, `reason`) — reports processed, i.e. crash volume.
 - `kube_autopsy_oom_events_total` (Counter; `namespace`, `node`) — OOM kills detected.
 - `kube_autopsy_victim_anon_rss_bytes` (Histogram; `namespace`, `container`) — the victim's anonymous RSS.
 - `kube_autopsy_trigger_processes_total` (Counter; `comm`) — which applications trigger OOMs.
-- `kube_autopsy_report_age_seconds` (Histogram) — age at GC, so you can tell whether `--ttl-hours` discards reports before anyone reads them.
+- `kube_autopsy_webhook_deliveries_total` (Counter; `result`) — `success`, `retry`, or `dropped`. A non-zero `dropped` rate means crash alerts were abandoned after the retry window and nobody was told.
+- `kube_autopsy_webhook_duration_seconds` (Histogram) — delivery latency. Delivery blocks a reconcile worker, so this is also the controller's throughput.
+- `kube_autopsy_reports_trimmed_total` (Counter) — reports deleted to honour `--max-reports` rather than because they aged out.
+- `kube_autopsy_gc_errors_total` (Counter) — failed deletions. Non-zero means retention is not actually being enforced.
+- `kube_autopsy_report_age_seconds` (Histogram) — age at deletion, observed only on a successful delete.
 
 From the agent:
 
+- `kube_autopsy_events_received_total` (Counter) — OOM events read from the kernel, before any filtering. This is the denominator for everything below: without it, "no reports" cannot be told apart from "no kills".
 - `kube_autopsy_capture_latency_seconds` (Histogram) — kernel event to report written.
 - `kube_autopsy_log_capture_failures_total` (Counter; `namespace`) — log tails lost to the runtime tearing down first.
 - `kube_autopsy_reports_suppressed_total` (Counter) — crashes dropped by the cooldown, i.e. deliberately rather than lost.
-- `kube_autopsy_report_errors_total` (Counter; `stage`) — crashes not recorded at all, by failing stage.
+- `kube_autopsy_unsupported_kernel_events_total` (Counter) — events where the kernel's memory layout was not recognised, so the report carries no RSS breakdown.
+- `kube_autopsy_report_errors_total` (Counter; `stage`) — crashes not turned into a report. `no_pod` is expected on a node-level OOM that killed something outside a pod; `list_pods`, `create` and `status` are genuine failures.
+
+### Alerting on the agent not working
+
+The failure mode worth alerting on is silence — an agent that is up but tracing
+nothing looks exactly like a quiet node. These two say otherwise:
+
+```yaml
+- alert: KubeAutopsyResolvingNothing
+  # Every kill received, none attributable to a pod: usually the wrong cgroup
+  # hierarchy, or a runtime whose cgroup names are not recognised.
+  expr: |
+    sum(rate(kube_autopsy_report_errors_total{stage="no_pod"}[15m]))
+      / sum(rate(kube_autopsy_events_received_total[15m])) > 0.99
+  for: 30m
+
+- alert: KubeAutopsyAlertsDropped
+  # The webhook endpoint has been failing long enough that crash alerts are
+  # being abandoned.
+  expr: increase(kube_autopsy_webhook_deliveries_total{result="dropped"}[1h]) > 0
+```
 
 The `comm` and `container` values are chosen by whoever can create pods, so they
 pass through a cardinality limiter rather than reaching Prometheus verbatim.
