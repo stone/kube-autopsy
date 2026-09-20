@@ -31,6 +31,6 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
 # not world-readable on several distributions, so a non-root default would break
 # --capture-logs. The controller does not need root and pins runAsNonRoot with
 # runAsUser 65532 in its own securityContext, which is where that belongs.
-FROM gcr.io/distroless/static:latest@sha256:f2ea2709ac8db56323cbd7d014277f32cb572d9ea124b0076f7aafe5980678fe
+FROM gcr.io/distroless/static:latest@sha256:58133991db06659feaabe0f4e97a35cebf15ef4ea08f8a4c6d2ee5f75e4aa6a0
 COPY --from=builder /kube-autopsy /kube-autopsy
 ENTRYPOINT ["/kube-autopsy"]
