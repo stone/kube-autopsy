@@ -90,7 +90,7 @@ jobs:
           output-file: sbom.spdx.json
 
       - name: Setup kubectl
-        uses: azure/setup-kubectl@v5.1.0
+        uses: azure/setup-kubectl@v5.2.0
 
       - name: Build Kubernetes Manifests
         run: |
