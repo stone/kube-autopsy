@@ -181,7 +181,7 @@ jobs:
           cache: true
 
       - name: Install kind
-        uses: helm/kind-action@v1.15.1
+        uses: helm/kind-action@v1.15.2
         with:
           install_only: true
 
