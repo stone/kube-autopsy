@@ -2,7 +2,7 @@
 # cosign and publishes an SBOM; both describe a build whose inputs must be
 # identifiable, and a floating tag means the same source can produce a different
 # image tomorrow. Update these deliberately, alongside the Go toolchain bump.
-FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS builder
 WORKDIR /workspace
 
 # Dependencies are resolved from the committed go.mod/go.sum only; -mod=readonly
